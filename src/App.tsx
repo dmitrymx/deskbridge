@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   Monitor,
   Wifi,
@@ -148,7 +149,13 @@ function App() {
 
   const handleDownloadLogs = async () => {
     try {
-      const saved = await invoke<boolean>("save_log_file");
+      const destPath = await save({
+        filters: [{ name: "Log Files", extensions: ["log", "txt"] }],
+        defaultPath: "deskbridge.log",
+      });
+      if (!destPath) return; // user cancelled
+
+      const saved = await invoke<boolean>("save_log_file", { destPath });
       if (saved) {
         alert("Файл логов успешно сохранен!");
       }
@@ -352,7 +359,7 @@ function App() {
     }
 
     try {
-      const filePath = await invoke<string | null>("select_file");
+      const filePath = await open({ multiple: false, directory: false }) as string | null;
       if (!filePath) return; // user cancelled
 
       setIsSending(true);

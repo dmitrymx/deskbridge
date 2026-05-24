@@ -73,12 +73,6 @@ fn get_discovered_nodes(app_handle: tauri::AppHandle) -> Result<Vec<mdns::Discov
 }
 
 #[tauri::command]
-async fn select_file() -> Result<Option<String>, String> {
-    let file = rfd::AsyncFileDialog::new().pick_file().await;
-    Ok(file.map(|f| f.path().to_string_lossy().to_string()))
-}
-
-#[tauri::command]
 fn get_log_content() -> Result<String, String> {
     let log_path = kvm::LOG_FILE_PATH.get().ok_or("Logger not initialized")?;
     if !log_path.exists() {
@@ -98,30 +92,21 @@ fn clear_logs() -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn save_log_file() -> Result<bool, String> {
+fn save_log_file(dest_path: String) -> Result<bool, String> {
     let log_path = kvm::LOG_FILE_PATH.get().ok_or("Logger not initialized")?.clone();
     if !log_path.exists() {
         return Err("Log file does not exist yet".to_string());
     }
-
-    let file = rfd::AsyncFileDialog::new()
-        .set_file_name("deskbridge.log")
-        .add_filter("Log Files", &["log", "txt"])
-        .save_file()
-        .await;
-
-    if let Some(file) = file {
-        std::fs::copy(&log_path, file.path()).map_err(|e| e.to_string())?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    let dest = std::path::Path::new(&dest_path);
+    std::fs::copy(&log_path, dest).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(MdnsState::new())
         .setup(|app| {
             let handle = app.handle().clone();
@@ -155,7 +140,6 @@ pub fn run() {
             p2p::cancel_file_transfer,
             get_local_info,
             get_discovered_nodes,
-            select_file,
             get_network_interfaces,
             get_log_content,
             clear_logs,
@@ -164,4 +148,3 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
