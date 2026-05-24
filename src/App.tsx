@@ -1,7 +1,8 @@
-﻿import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
+import { openPath } from "@tauri-apps/plugin-opener";
 import {
   Monitor,
   Wifi,
@@ -20,7 +21,8 @@ import {
   ArrowRightLeft,
   FileText,
   Trash2,
-  Keyboard
+  Keyboard,
+  FolderOpen
 } from "lucide-react";
 
 interface LocalInfo {
@@ -422,7 +424,7 @@ function App() {
             <h1 className="font-extrabold text-lg tracking-tight bg-gradient-to-r from-white via-neutral-100 to-neutral-400 bg-clip-text text-transparent">
               DeskBridge
             </h1>
-            <p className="text-[10px] text-neutral-500 font-mono tracking-wider">LOCAL MESH NETWORK • v2.5.0</p>
+            <p className="text-[10px] text-neutral-500 font-mono tracking-wider">LOCAL MESH NETWORK • v2.5.1</p>
           </div>
         </div>
 
@@ -813,6 +815,24 @@ function App() {
                     </div>
                   )}
 
+                  {fileProgress.status === "completed" && (
+                    <button
+                      onClick={async () => {
+                        try {
+                          // Open the Downloads/DeskBridge folder
+                          const home = await invoke<string>("get_received_files_dir");
+                          await openPath(home);
+                        } catch (e) {
+                          console.error("Failed to open folder:", e);
+                        }
+                      }}
+                      className="flex items-center justify-center gap-2 font-bold text-center border border-emerald-500/20 hover:border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 hover:text-emerald-200 rounded-xl py-2.5 transition active-depress text-[10px] uppercase tracking-wider"
+                    >
+                      <FolderOpen className="w-3.5 h-3.5" />
+                      Открыть папку с файлом
+                    </button>
+                  )}
+
                   {isSending && (
                     <button
                       onClick={handleCancelTransfer}
@@ -1072,7 +1092,7 @@ function App() {
 
       {/* Footer */}
       <footer className="py-5 border-t border-neutral-950 bg-neutral-950/40 text-center text-[10px] text-neutral-600 font-mono tracking-wider z-10">
-        DeskBridge v2.5.0 • Прямое P2P и KVM по локальной сети без облачных серверов
+        DeskBridge v2.5.1 • Прямое P2P и KVM по локальной сети без облачных серверов
       </footer>
     </div>
   );

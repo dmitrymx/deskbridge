@@ -24,6 +24,15 @@ struct FileProgressUpdate {
     sha256_matches: Option<bool>,
 }
 
+/// Returns the path where received files are saved (Downloads folder)
+#[tauri::command]
+pub fn get_received_files_dir() -> Result<String, String> {
+    let download_dir = dirs::download_dir().unwrap_or_else(|| {
+        dirs::home_dir().map(|h| h.join("Downloads")).unwrap_or_else(|| PathBuf::from("."))
+    });
+    Ok(download_dir.to_string_lossy().to_string())
+}
+
 /// Start the background P2P File Receiver server on port 53202
 pub fn start_p2p_file_server(app_handle: AppHandle) {
     tauri::async_runtime::spawn(async move {

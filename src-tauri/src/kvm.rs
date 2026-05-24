@@ -13,39 +13,61 @@ use serde::Serialize;
 // ============================================================================
 // Platform-Specific Cursor Capture
 // ============================================================================
-
-/// Lock cursor to a 1x1 pixel rect at screen center (Windows)
-/// Uses ClipCursor Win32 API — the standard approach used by lan-mouse, Barrier, etc.
+/// Barrier-style cursor capture (Windows)
+/// Instead of ClipCursor(1x1) which prevents ANY mouse movement (zero deltas),
+/// we use the approach from Barrier/Synergy:
+/// 1. Warp cursor to screen center
+/// 2. Hide the cursor
+/// 3. The delta sender thread re-warps to center at 120Hz
+/// 4. grab_callback calculates deltas from last known position
 #[cfg(target_os = "windows")]
 fn platform_capture_cursor() {
-    use windows::Win32::UI::WindowsAndMessaging::ClipCursor;
-    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{SetCursorPos, ShowCursor};
 
     let (w, h) = get_screen_size();
     let cx = (w / 2.0) as i32;
     let cy = (h / 2.0) as i32;
 
-    let rect = RECT {
-        left: cx,
-        top: cy,
-        right: cx + 1,
-        bottom: cy + 1,
-    };
     unsafe {
-        let _ = ClipCursor(Some(&rect));
+        let _ = SetCursorPos(cx, cy);
+        ShowCursor(false);
     }
-    log_write("INFO", &format!("KVM Host: Cursor clipped to center ({}, {})", cx, cy));
+    log_write("INFO", &format!("KVM Host: Cursor warped to center ({}, {}), hidden", cx, cy));
 }
 
-/// Release cursor clip (Windows)
+/// Release cursor (Windows) — show cursor again
 #[cfg(target_os = "windows")]
 fn platform_release_cursor() {
-    use windows::Win32::UI::WindowsAndMessaging::ClipCursor;
+    use windows::Win32::UI::WindowsAndMessaging::ShowCursor;
 
     unsafe {
-        let _ = ClipCursor(None);
+        ShowCursor(true);
     }
-    log_write("INFO", "KVM Host: Cursor clip released.");
+    log_write("INFO", "KVM Host: Cursor shown, released.");
+}
+
+/// Barrier-style: warp cursor to center + update LAST tracking
+/// Called at 120Hz from the delta sender thread AFTER draining deltas
+#[cfg(target_os = "windows")]
+fn platform_recenter_cursor() {
+    use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+
+    let (w, h) = get_screen_size();
+    let cx = (w / 2.0) as i32;
+    let cy = (h / 2.0) as i32;
+
+    // Update LAST position BEFORE warping so the synthetic event = 0 delta
+    LAST_X.store(cx, Ordering::SeqCst);
+    LAST_Y.store(cy, Ordering::SeqCst);
+
+    unsafe {
+        let _ = SetCursorPos(cx, cy);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn platform_recenter_cursor() {
+    // macOS: CGAssociateMouseAndMouseCursorPosition handles this natively
 }
 
 /// Dissociate mouse from cursor position (macOS)
@@ -681,7 +703,11 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                     }
                 }
 
-                log_write("INFO", "KVM Host: Writer thread ended.");
+                log_write("INFO", "KVM Host: Writer thread ending — sending ReleaseControl to client.");
+                // Send explicit ReleaseControl (type=6) so client immediately releases
+                let release_cmd = [6u8, 0, 0, 0, 0, 0, 0, 0, 0];
+                let _ = writer_socket.write_all(&release_cmd);
+                let _ = writer_socket.flush();
                 deactivate_kvm_host();
                 set_active_sender(None);
 
@@ -695,6 +721,7 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
             });
 
             // Step 8: Spawn delta sender thread (drains ACCUM at ~120Hz)
+            // Uses Barrier-style approach: drain deltas → send → recenter cursor
             thread::spawn(move || {
                 log_write("INFO", "KVM Host: Delta sender thread started (120Hz).");
                 while KVM_ACTIVE.load(Ordering::SeqCst) {
@@ -712,6 +739,11 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                             break;
                         }
                     }
+
+                    // Barrier-style: warp cursor back to center after reading deltas
+                    // This ensures cursor doesn't drift to screen edge
+                    // LAST_X/LAST_Y updated BEFORE warp so synthetic event = 0 delta
+                    platform_recenter_cursor();
                 }
                 log_write("INFO", "KVM Host: Delta sender thread ended.");
             });
@@ -846,6 +878,11 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                                         let dx = i32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
                                         let dy = i32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
                                         let _ = simulate(&EventType::Wheel { delta_x: dx as i64, delta_y: dy as i64 });
+                                    }
+                                    6 => {
+                                        // ReleaseControl from host — session over
+                                        log_write("INFO", "KVM Client: Host sent ReleaseControl. Ending session.");
+                                        controlled = false;
                                     }
                                     7 => {} // Keepalive
                                     _ => {}

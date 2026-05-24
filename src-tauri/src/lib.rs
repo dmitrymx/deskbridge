@@ -161,6 +161,7 @@ pub fn run() {
             p2p::send_file,
             p2p::cancel_file_transfer,
             p2p::pick_and_send_file,
+            p2p::get_received_files_dir,
             get_local_info,
             get_discovered_nodes,
             get_network_interfaces,
