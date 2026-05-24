@@ -844,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "deskbridge"
-version = "0.1.0"
+version = "2.3.0"
 dependencies = [
  "core-graphics 0.24.0",
  "dirs",
