@@ -1070,13 +1070,16 @@ fn get_portal_html() -> &'static str {
 
 #[tauri::command]
 pub async fn pick_file_dialog() -> Result<Option<String>, String> {
-    let result = tokio::task::spawn_blocking(|| {
-        rfd::FileDialog::new()
+    // Use std::thread::spawn (not tokio::spawn_blocking) for proper COM init on Windows.
+    // rfd::FileDialog internally calls CoInitializeEx which needs a fresh thread, not
+    // a tokio threadpool thread that might have conflicting COM apartment state.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let result = rfd::FileDialog::new()
             .set_title("Выберите файл для отправки")
-            .pick_file()
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-
+            .pick_file();
+        let _ = tx.send(result);
+    });
+    let result = rx.await.map_err(|e| e.to_string())?;
     Ok(result.map(|p| p.to_string_lossy().to_string()))
 }

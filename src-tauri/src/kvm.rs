@@ -552,7 +552,20 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
             let tx_for_mouse = tx; // delta sender thread uses this
             set_active_sender(Some(tx_for_keys));
 
-            // Step 6: Spawn writer thread (reads from rx, writes to TCP)
+            // Step 6: ACTIVATE NOW — AFTER LAST_X/LAST_Y are set, BEFORE threads start
+            // This is critical: threads check KVM_ACTIVE in their loops,
+            // so it must be true before they start. And LAST_X/LAST_Y must
+            // be set before this to prevent delta explosion.
+            KVM_ACTIVE.store(true, Ordering::SeqCst);
+            IS_CONNECTING.store(false, Ordering::SeqCst);
+
+            let _ = app_handle.emit("kvm-status", KvmStatusUpdate {
+                active: true, role: "host".to_string(), target: ip.clone(),
+            });
+
+            log_write("INFO", "KVM Host: Session active. Delta batching at 120Hz.");
+
+            // Step 7: Spawn writer thread (reads from rx, writes to TCP)
             let mut writer_socket = stream.try_clone().unwrap();
             let app_writer = app_handle.clone();
             thread::spawn(move || {
@@ -599,7 +612,7 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                 });
             });
 
-            // Step 7: Spawn delta sender thread (drains ACCUM at ~120Hz)
+            // Step 8: Spawn delta sender thread (drains ACCUM at ~120Hz)
             thread::spawn(move || {
                 log_write("INFO", "KVM Host: Delta sender thread started (120Hz).");
                 while KVM_ACTIVE.load(Ordering::SeqCst) {
@@ -621,7 +634,7 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                 log_write("INFO", "KVM Host: Delta sender thread ended.");
             });
 
-            // Step 8: Spawn reader thread (listens for ReleaseControl from client)
+            // Step 9: Spawn reader thread (listens for ReleaseControl from client)
             let mut read_socket = stream;
             thread::spawn(move || {
                 let mut buf = [0u8; 9];
@@ -642,16 +655,6 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                     }
                 }
             });
-
-            // Step 9: NOW activate — grab_callback starts capturing from this moment
-            KVM_ACTIVE.store(true, Ordering::SeqCst);
-            IS_CONNECTING.store(false, Ordering::SeqCst);
-
-            let _ = app_handle.emit("kvm-status", KvmStatusUpdate {
-                active: true, role: "host".to_string(), target: ip.clone(),
-            });
-
-            log_write("INFO", "KVM Host: Session active. Delta batching at 120Hz.");
         }
         Err(e) => {
             log_write("ERROR", &format!("KVM Host: Failed to connect to {}: {:?}", address, e));
