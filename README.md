@@ -2,11 +2,11 @@
 
 <img src="src-tauri/icons/128x128.png" width="96" alt="DeskBridge Logo" />
 
-# DeskBridge (v2.6.0)
+# DeskBridge (v2.6.1)
 
 **Беспроводной KVM-переключатель с общим буфером обмена и P2P-обменником файлов для локальной сети**
 
-[![Version](https://img.shields.io/badge/version-2.6.0-blue?style=for-the-badge)](https://github.com/dmitrymx/deskbridge/releases)
+[![Version](https://img.shields.io/badge/version-2.6.1-blue?style=for-the-badge)](https://github.com/dmitrymx/deskbridge/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-FFC131?style=for-the-badge&logo=tauri)](https://tauri.app)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react)](https://react.dev)
 [![Rust](https://img.shields.io/badge/Rust-2021-000000?style=for-the-badge&logo=rust)](https://www.rust-lang.org)
@@ -43,7 +43,7 @@
 
 ## 📋 Таблица сравнения версий
 
-| Возможность | v1.0.0 | v2.2.0 | v2.5.0 | v2.6.0 (Текущая) |
+| Возможность | v1.0.0 | v2.2.0 | v2.5.0 | v2.6.1 (Текущая) |
 | :--- | :---: | :---: | :---: | :---: |
 | **Локальное P2P-копирование** | ❌ | ✅ | ✅ | ✅ |
 | **Веб-портал для iOS/Android** | ❌ | ✅ | ✅ | ✅ |
@@ -59,7 +59,7 @@
 
 ---
 
-## 🛠 Что нового в версии v2.6.0
+## 🛠 Что нового в версии v2.6.1
 
 *   **📋 Общий буфер обмена:** Автоматическая синхронизация скопированного текста между ПК через KVM-соединение. Копируете текст на Windows → вставляете на Mac и наоборот. Использует `arboard` крейт для кроссплатформенного доступа к clipboard.
 *   **🎚️ Настройка скорости курсора:** Ползунок 1x–5x в настройках для компенсации разницы DPI/разрешения между Windows и Mac. По умолчанию 3.0x.

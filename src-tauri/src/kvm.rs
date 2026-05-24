@@ -1,5 +1,6 @@
 use rdev::{simulate, display_size, Button, Event, EventType, Key};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU64, AtomicU8, Ordering};
+use clipboard_rs::{Clipboard as ClipboardTrait, ClipboardContext};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -200,6 +201,7 @@ pub static SCROLL_SPEED: AtomicU16 = AtomicU16::new(30); // x10, so 30 = 3.0x
 
 // Clipboard sync flag
 pub static CLIPBOARD_SYNC: AtomicBool = AtomicBool::new(true);
+static LAST_REMOTE_CLIP_HASH: AtomicU64 = AtomicU64::new(0);
 
 // Connection guard
 pub static IS_CONNECTING: AtomicBool = AtomicBool::new(false);
@@ -773,15 +775,15 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                     log_write("INFO", "KVM Host: Clipboard sync thread started.");
                     let mut last_text_hash: u64 = 0;
                     while KVM_ACTIVE.load(Ordering::SeqCst) {
-                        thread::sleep(Duration::from_millis(500));
+                        thread::sleep(Duration::from_millis(250));
                         if !CLIPBOARD_SYNC.load(Ordering::SeqCst) { continue; }
 
-                        if let Ok(mut clip) = arboard::Clipboard::new() {
+                        if let Ok(ctx) = ClipboardContext::new() {
                             // Check text clipboard
-                            if let Ok(text) = clip.get_text() {
+                            if let Ok(text) = ctx.get_text() {
                                 if !text.is_empty() {
                                     let hash = simple_hash(text.as_bytes());
-                                    if hash != last_text_hash {
+                                    if hash != last_text_hash && hash != LAST_REMOTE_CLIP_HASH.load(Ordering::SeqCst) {
                                         last_text_hash = hash;
                                         let text_bytes = text.as_bytes();
                                         let len = text_bytes.len() as u32;
@@ -822,8 +824,9 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                                         let mut data = vec![0u8; len];
                                         if read_socket.read_exact(&mut data).is_ok() {
                                             if let Ok(text) = String::from_utf8(data) {
-                                                if let Ok(mut clip) = arboard::Clipboard::new() {
-                                                    let _ = clip.set_text(&text);
+                                                if let Ok(ctx) = ClipboardContext::new() {
+                                                    let _ = ctx.set_text(text.clone());
+                                                    LAST_REMOTE_CLIP_HASH.store(simple_hash(text.as_bytes()), Ordering::SeqCst);
                                                     log_write("INFO", &format!("KVM Host: Clipboard text received ({} bytes)", len));
                                                 }
                                             }
@@ -906,14 +909,14 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                     thread::spawn(move || {
                         let mut last_text_hash: u64 = 0;
                         while clip_active2.load(Ordering::SeqCst) {
-                            thread::sleep(Duration::from_millis(500));
+                            thread::sleep(Duration::from_millis(250));
                             if !CLIPBOARD_SYNC.load(Ordering::SeqCst) { continue; }
 
-                            if let Ok(mut clip) = arboard::Clipboard::new() {
-                                if let Ok(text) = clip.get_text() {
+                            if let Ok(ctx) = ClipboardContext::new() {
+                                if let Ok(text) = ctx.get_text() {
                                     if !text.is_empty() {
                                         let hash = simple_hash(text.as_bytes());
-                                        if hash != last_text_hash {
+                                        if hash != last_text_hash && hash != LAST_REMOTE_CLIP_HASH.load(Ordering::SeqCst) {
                                             last_text_hash = hash;
                                             let text_bytes = text.as_bytes();
                                             let len = text_bytes.len() as u32;
@@ -1020,8 +1023,9 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                                             let mut data = vec![0u8; len];
                                             if socket.read_exact(&mut data).is_ok() {
                                                 if let Ok(text) = String::from_utf8(data) {
-                                                    if let Ok(mut clip) = arboard::Clipboard::new() {
-                                                        let _ = clip.set_text(&text);
+                                                    if let Ok(ctx) = ClipboardContext::new() {
+                                                        let _ = ctx.set_text(text.clone());
+                                                        LAST_REMOTE_CLIP_HASH.store(simple_hash(text.as_bytes()), Ordering::SeqCst);
                                                         log_write("INFO", &format!("KVM Client: Clipboard text received ({} bytes)", len));
                                                     }
                                                 }

@@ -429,7 +429,7 @@ function App() {
             <h1 className="font-extrabold text-lg tracking-tight bg-gradient-to-r from-white via-neutral-100 to-neutral-400 bg-clip-text text-transparent">
               DeskBridge
             </h1>
-            <p className="text-[10px] text-neutral-500 font-mono tracking-wider">LOCAL MESH NETWORK • v2.6.0</p>
+            <p className="text-[10px] text-neutral-500 font-mono tracking-wider">LOCAL MESH NETWORK • v2.6.1</p>
           </div>
         </div>
 
@@ -1180,7 +1180,7 @@ function App() {
 
       {/* Footer */}
       <footer className="py-5 border-t border-neutral-950 bg-neutral-950/40 text-center text-[10px] text-neutral-600 font-mono tracking-wider z-10">
-        DeskBridge v2.6.0 • Прямое P2P и KVM по локальной сети без облачных серверов
+        DeskBridge v2.6.1 • Прямое P2P и KVM по локальной сети без облачных серверов
       </footer>
     </div>
   );
