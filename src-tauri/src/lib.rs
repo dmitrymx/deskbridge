@@ -145,6 +145,12 @@ pub fn run() {
             clear_logs,
             save_log_file
         ])
+        .on_window_event(|_window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                kvm::log_write("INFO", "Window close requested. Force exiting process to clean up threads and hooks.");
+                std::process::exit(0);
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
