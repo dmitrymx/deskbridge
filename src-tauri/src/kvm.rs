@@ -152,6 +152,14 @@ pub fn log_write(level: &str, message: &str) {
     }
 }
 
+fn simple_hash(data: &[u8]) -> u64 {
+    let mut hash: u64 = 5381;
+    for &b in data {
+        hash = hash.wrapping_mul(33).wrapping_add(b as u64);
+    }
+    hash
+}
+
 // ============================================================================
 // Atomic State Variables
 // ============================================================================
@@ -187,7 +195,11 @@ pub static HOTKEY_KEY: AtomicU16 = AtomicU16::new(11); // KeyK
 // Cursor speed multiplier for KVM client (applied to received deltas)
 // Default 2.0 — compensates for resolution/DPI differences between host and client
 // (Barrier uses CGEventCreateMouseEvent with delta fields; we use a simpler scaling approach)
-pub static CURSOR_SPEED: AtomicU16 = AtomicU16::new(20); // x10, so 20 = 2.0x
+pub static CURSOR_SPEED: AtomicU16 = AtomicU16::new(30); // x10, so 30 = 3.0x
+pub static SCROLL_SPEED: AtomicU16 = AtomicU16::new(30); // x10, so 30 = 3.0x
+
+// Clipboard sync flag
+pub static CLIPBOARD_SYNC: AtomicBool = AtomicBool::new(true);
 
 // Connection guard
 pub static IS_CONNECTING: AtomicBool = AtomicBool::new(false);
@@ -661,6 +673,7 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
             let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
             let tx_for_keys = tx.clone();
             let tx_for_mouse = tx; // delta sender thread uses this
+            let tx_for_clipboard = tx_for_keys.clone(); // clipboard thread
             set_active_sender(Some(tx_for_keys));
 
             // Step 6: ACTIVATE NOW — AFTER LAST_X/LAST_Y are set, BEFORE threads start
@@ -753,6 +766,43 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                 log_write("INFO", "KVM Host: Delta sender thread ended.");
             });
 
+            // Step 8b: Clipboard sync thread (host → client)
+            if CLIPBOARD_SYNC.load(Ordering::SeqCst) {
+                let tx_clip = tx_for_clipboard;
+                thread::spawn(move || {
+                    log_write("INFO", "KVM Host: Clipboard sync thread started.");
+                    let mut last_text_hash: u64 = 0;
+                    while KVM_ACTIVE.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(500));
+                        if !CLIPBOARD_SYNC.load(Ordering::SeqCst) { continue; }
+
+                        if let Ok(mut clip) = arboard::Clipboard::new() {
+                            // Check text clipboard
+                            if let Ok(text) = clip.get_text() {
+                                if !text.is_empty() {
+                                    let hash = simple_hash(text.as_bytes());
+                                    if hash != last_text_hash {
+                                        last_text_hash = hash;
+                                        let text_bytes = text.as_bytes();
+                                        let len = text_bytes.len() as u32;
+                                        if len < 10_000_000 { // Max 10MB
+                                            let mut payload = Vec::with_capacity(9 + len as usize);
+                                            payload.push(8); // ClipboardText
+                                            payload.extend_from_slice(&len.to_le_bytes());
+                                            payload.extend_from_slice(&[0, 0, 0, 0]); // pad to 9 bytes header
+                                            payload.extend_from_slice(text_bytes);
+                                            let _ = tx_clip.send(payload);
+                                            log_write("INFO", &format!("KVM Host: Clipboard text sent ({} bytes)", len));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    log_write("INFO", "KVM Host: Clipboard sync thread ended.");
+                });
+            }
+
             // Step 9: Spawn reader thread (listens for ReleaseControl from client)
             let mut read_socket = stream;
             thread::spawn(move || {
@@ -760,10 +810,35 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                 loop {
                     match read_socket.read_exact(&mut buf) {
                         Ok(_) => {
-                            if buf[0] == 6 {
-                                log_write("INFO", "KVM Host: Client requested release.");
-                                deactivate_kvm_host();
-                                break;
+                            match buf[0] {
+                                6 => {
+                                    log_write("INFO", "KVM Host: Client requested release.");
+                                    deactivate_kvm_host();
+                                    break;
+                                }
+                                8 => {
+                                    let len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                                    if len < 10_000_000 {
+                                        let mut data = vec![0u8; len];
+                                        if read_socket.read_exact(&mut data).is_ok() {
+                                            if let Ok(text) = String::from_utf8(data) {
+                                                if let Ok(mut clip) = arboard::Clipboard::new() {
+                                                    let _ = clip.set_text(&text);
+                                                    log_write("INFO", &format!("KVM Host: Clipboard text received ({} bytes)", len));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                9 => {
+                                    // ClipboardImage placeholder — skip data
+                                    let len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                                    if len < 10_000_000 {
+                                        let mut data = vec![0u8; len];
+                                        let _ = read_socket.read_exact(&mut data);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                         Err(e) => {
@@ -822,6 +897,40 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                     let mut controlled = true;
 
                     log_write("INFO", &format!("KVM Client: Control session started. Accessibility: {}", check_accessibility()));
+
+                    // Clipboard sync thread (client → host)
+                    let mut clip_write = write_socket.try_clone().unwrap();
+                    let clip_active = std::sync::Arc::new(AtomicBool::new(true));
+                    let clip_active2 = clip_active.clone();
+
+                    thread::spawn(move || {
+                        let mut last_text_hash: u64 = 0;
+                        while clip_active2.load(Ordering::SeqCst) {
+                            thread::sleep(Duration::from_millis(500));
+                            if !CLIPBOARD_SYNC.load(Ordering::SeqCst) { continue; }
+
+                            if let Ok(mut clip) = arboard::Clipboard::new() {
+                                if let Ok(text) = clip.get_text() {
+                                    if !text.is_empty() {
+                                        let hash = simple_hash(text.as_bytes());
+                                        if hash != last_text_hash {
+                                            last_text_hash = hash;
+                                            let text_bytes = text.as_bytes();
+                                            let len = text_bytes.len() as u32;
+                                            if len < 10_000_000 {
+                                                let mut header = [0u8; 9];
+                                                header[0] = 8;
+                                                header[1..5].copy_from_slice(&len.to_le_bytes());
+                                                let _ = clip_write.write_all(&header);
+                                                let _ = clip_write.write_all(text_bytes);
+                                                let _ = clip_write.flush();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
 
                     while controlled {
                         match socket.read_exact(&mut buf) {
@@ -891,9 +1000,12 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                                         let _ = simulate(&EventType::ButtonRelease(btn));
                                     }
                                     5 => {
-                                        let dx = i32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
-                                        let dy = i32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
-                                        let _ = simulate(&EventType::Wheel { delta_x: dx as i64, delta_y: dy as i64 });
+                                        let raw_dx = i32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
+                                        let raw_dy = i32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
+                                        let scroll_speed = SCROLL_SPEED.load(Ordering::Relaxed) as f64 / 10.0;
+                                        let dx = (raw_dx as f64 * scroll_speed) as i64;
+                                        let dy = (raw_dy as f64 * scroll_speed) as i64;
+                                        let _ = simulate(&EventType::Wheel { delta_x: dx, delta_y: dy });
                                     }
                                     6 => {
                                         // ReleaseControl from host — session over
@@ -901,6 +1013,29 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                                         controlled = false;
                                     }
                                     7 => {} // Keepalive
+                                    8 => {
+                                        // ClipboardText from host
+                                        let len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                                        if len < 10_000_000 {
+                                            let mut data = vec![0u8; len];
+                                            if socket.read_exact(&mut data).is_ok() {
+                                                if let Ok(text) = String::from_utf8(data) {
+                                                    if let Ok(mut clip) = arboard::Clipboard::new() {
+                                                        let _ = clip.set_text(&text);
+                                                        log_write("INFO", &format!("KVM Client: Clipboard text received ({} bytes)", len));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    9 => {
+                                        // ClipboardImage placeholder — skip data
+                                        let len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                                        if len < 10_000_000 {
+                                            let mut data = vec![0u8; len];
+                                            let _ = socket.read_exact(&mut data);
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -911,6 +1046,7 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                         }
                     }
 
+                    clip_active.store(false, Ordering::SeqCst);
                     log_write("INFO", "KVM Client: Control session ended.");
                     let _ = app_handle.emit("kvm-status", KvmStatusUpdate {
                         active: false, role: "idle".to_string(), target: "".to_string(),
@@ -979,4 +1115,25 @@ pub fn set_kvm_hotkey(ctrl: bool, alt: bool, shift: bool, key_code: u16) -> Resu
     HOTKEY_KEY.store(key_code, Ordering::SeqCst);
     log_write("INFO", &format!("KVM Hotkey updated: Ctrl={}, Alt={}, Shift={}, KeyCode={}", ctrl, alt, shift, key_code));
     Ok(())
+}
+
+#[tauri::command]
+pub fn set_cursor_speed(speed: u16) -> Result<String, String> {
+    CURSOR_SPEED.store(speed, Ordering::SeqCst);
+    log_write("INFO", &format!("Cursor speed set to {}.{}x", speed / 10, speed % 10));
+    Ok("ok".to_string())
+}
+
+#[tauri::command]
+pub fn set_scroll_speed(speed: u16) -> Result<String, String> {
+    SCROLL_SPEED.store(speed, Ordering::SeqCst);
+    log_write("INFO", &format!("Scroll speed set to {}.{}x", speed / 10, speed % 10));
+    Ok("ok".to_string())
+}
+
+#[tauri::command]
+pub fn set_clipboard_sync(enabled: bool) -> Result<String, String> {
+    CLIPBOARD_SYNC.store(enabled, Ordering::SeqCst);
+    log_write("INFO", &format!("Clipboard sync: {}", if enabled { "enabled" } else { "disabled" }));
+    Ok("ok".to_string())
 }

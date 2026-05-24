@@ -140,6 +140,11 @@ function App() {
   const [fileProgress, setFileProgress] = useState<FileProgress | null>(null);
   const [isSending, setIsSending] = useState(false);
 
+  // Speed & Clipboard settings
+  const [cursorSpeed, setCursorSpeed] = useState(30); // x10, so 30 = 3.0x
+  const [scrollSpeed, setScrollSpeed] = useState(30);
+  const [clipboardSync, setClipboardSync] = useState(true);
+
   // Active IP address helper (user-selected interface or fallback to system default)
   const activeIp = selectedInterface?.ip || localInfo.ip;
 
@@ -424,7 +429,7 @@ function App() {
             <h1 className="font-extrabold text-lg tracking-tight bg-gradient-to-r from-white via-neutral-100 to-neutral-400 bg-clip-text text-transparent">
               DeskBridge
             </h1>
-            <p className="text-[10px] text-neutral-500 font-mono tracking-wider">LOCAL MESH NETWORK • v2.5.2</p>
+            <p className="text-[10px] text-neutral-500 font-mono tracking-wider">LOCAL MESH NETWORK • v2.6.0</p>
           </div>
         </div>
 
@@ -968,6 +973,89 @@ function App() {
               </div>
             </div>
 
+            {/* Section 2b: Speed & Clipboard Settings */}
+            <div className="flex flex-col gap-3">
+              <h4 className="text-[10px] font-extrabold text-emerald-400 uppercase tracking-wider flex items-center gap-1.5">
+                <MousePointer className="w-3.5 h-3.5" /> Скорость и буфер обмена
+              </h4>
+
+              <div className="bg-neutral-950/60 border border-neutral-900 rounded-2xl p-4 flex flex-col gap-4">
+                {/* Cursor Speed */}
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-neutral-400 text-xs font-medium">Скорость курсора</span>
+                    <span className="text-xs font-mono text-emerald-300 font-bold">{(cursorSpeed / 10).toFixed(1)}x</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={10}
+                    max={50}
+                    step={5}
+                    value={cursorSpeed}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value, 10);
+                      setCursorSpeed(val);
+                      invoke("set_cursor_speed", { speed: val });
+                    }}
+                    className="w-full h-1.5 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                  />
+                  <div className="flex justify-between text-[9px] text-neutral-600 font-mono">
+                    <span>1.0x</span>
+                    <span>3.0x</span>
+                    <span>5.0x</span>
+                  </div>
+                </div>
+
+                {/* Scroll Speed */}
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-neutral-400 text-xs font-medium">Скорость прокрутки</span>
+                    <span className="text-xs font-mono text-emerald-300 font-bold">{(scrollSpeed / 10).toFixed(1)}x</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={10}
+                    max={50}
+                    step={5}
+                    value={scrollSpeed}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value, 10);
+                      setScrollSpeed(val);
+                      invoke("set_scroll_speed", { speed: val });
+                    }}
+                    className="w-full h-1.5 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                  />
+                  <div className="flex justify-between text-[9px] text-neutral-600 font-mono">
+                    <span>1.0x</span>
+                    <span>3.0x</span>
+                    <span>5.0x</span>
+                  </div>
+                </div>
+
+                <div className="h-[1px] bg-neutral-900" />
+
+                {/* Clipboard Sync Toggle */}
+                <div className="flex items-center justify-between">
+                  <div className="flex flex-col gap-0.5">
+                    <span className="text-neutral-300 text-xs font-medium">Общий буфер обмена</span>
+                    <span className="text-[10px] text-neutral-500">Автоматическая синхронизация текста между ПК</span>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={clipboardSync}
+                      onChange={(e) => {
+                        setClipboardSync(e.target.checked);
+                        invoke("set_clipboard_sync", { enabled: e.target.checked });
+                      }}
+                      className="sr-only peer"
+                    />
+                    <div className="w-9 h-5 bg-neutral-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-neutral-400 after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-600 peer-checked:after:bg-white"></div>
+                  </label>
+                </div>
+              </div>
+            </div>
+
             {/* Section 3: iOS/Android Web Portal */}
             <div className="flex flex-col gap-3">
               <h4 className="text-[10px] font-extrabold text-indigo-400 uppercase tracking-wider flex items-center gap-1.5">
@@ -1092,7 +1180,7 @@ function App() {
 
       {/* Footer */}
       <footer className="py-5 border-t border-neutral-950 bg-neutral-950/40 text-center text-[10px] text-neutral-600 font-mono tracking-wider z-10">
-        DeskBridge v2.5.2 • Прямое P2P и KVM по локальной сети без облачных серверов
+        DeskBridge v2.6.0 • Прямое P2P и KVM по локальной сети без облачных серверов
       </footer>
     </div>
   );
