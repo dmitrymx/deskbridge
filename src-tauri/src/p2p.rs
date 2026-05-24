@@ -1070,16 +1070,34 @@ fn get_portal_html() -> &'static str {
 
 #[tauri::command]
 pub async fn pick_file_dialog() -> Result<Option<String>, String> {
-    // Use std::thread::spawn (not tokio::spawn_blocking) for proper COM init on Windows.
-    // rfd::FileDialog internally calls CoInitializeEx which needs a fresh thread, not
-    // a tokio threadpool thread that might have conflicting COM apartment state.
+    crate::kvm::log_write("INFO", "pick_file_dialog: Opening file dialog...");
+    
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        let result = rfd::FileDialog::new()
-            .set_title("Выберите файл для отправки")
-            .pick_file();
-        let _ = tx.send(result);
+        // Catch any panic in the dialog thread
+        let result = std::panic::catch_unwind(|| {
+            rfd::FileDialog::new()
+                .set_title("Выберите файл для отправки")
+                .pick_file()
+        });
+        
+        match result {
+            Ok(file) => {
+                crate::kvm::log_write("INFO", &format!("pick_file_dialog: Result: {:?}", file.as_ref().map(|p| p.to_string_lossy().to_string())));
+                let _ = tx.send(file);
+            }
+            Err(e) => {
+                crate::kvm::log_write("FATAL", &format!("pick_file_dialog: PANIC in dialog thread: {:?}", e));
+                let _ = tx.send(None);
+            }
+        }
     });
-    let result = rx.await.map_err(|e| e.to_string())?;
+    
+    let result = rx.await.map_err(|e| {
+        let msg = format!("pick_file_dialog: Channel error: {}", e);
+        crate::kvm::log_write("ERROR", &msg);
+        msg
+    })?;
+    
     Ok(result.map(|p| p.to_string_lossy().to_string()))
 }

@@ -102,9 +102,17 @@ pub fn init_logger(app_handle: &AppHandle) {
     });
     let _ = std::fs::create_dir_all(&log_dir);
     let log_file = log_dir.join("deskbridge.log");
+    
+    // Back up previous log so crash info is never lost
+    if log_file.exists() {
+        let prev = log_dir.join("deskbridge.prev.log");
+        let _ = std::fs::copy(&log_file, &prev);
+    }
+    
     let _ = LOG_FILE_PATH.set(log_file.clone());
     
-    if let Ok(mut f) = File::create(&log_file) {
+    // APPEND, not truncate! Previous session's crash info is preserved above in .prev
+    if let Ok(mut f) = OpenOptions::new().create(true).write(true).truncate(true).open(&log_file) {
         let _ = f.write_all(b"=== DeskBridge Session Started at UTC ===\n");
     }
     log_write("INFO", &format!("Logger initialized. Log path: {:?}", log_file));
