@@ -34,10 +34,7 @@
 
 ## 📸 Скриншоты / Screenshots
 
-<div align="center">
-  <img src="screenshots/media__1779622897466.png" width="400" alt="DeskBridge Dashboard" />
-  <img src="screenshots/media__1779622916489.png" width="400" alt="DeskBridge Settings" />
-</div>
+
 
 ---
 
@@ -125,7 +122,7 @@
 **Максимов Д.А. (dmitrymx)**
 *   🌐 **Личный сайт**: [mxmvdev.ru](https://mxmvdev.ru)
 *   💬 **Telegram**: [@dmitrymx](https://t.me/dmitrymx)
-*   ✉️ **Email**: mail@mxmvdev.ru
+*   ✉️ **Email**: sorrelwm@gmail.com
 
 ---
 
