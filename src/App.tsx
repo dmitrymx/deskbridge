@@ -16,7 +16,10 @@ import {
   Copy,
   Activity,
   Layers,
-  ArrowRightLeft
+  ArrowRightLeft,
+  FileText,
+  Trash2,
+  Keyboard
 } from "lucide-react";
 
 interface LocalInfo {
@@ -52,6 +55,19 @@ interface NetworkInterface {
   is_virtual: boolean;
 }
 
+const KEYS_LIST = [
+  { name: "A", code: 1 }, { name: "B", code: 2 }, { name: "C", code: 3 }, { name: "D", code: 4 },
+  { name: "E", code: 5 }, { name: "F", code: 6 }, { name: "G", code: 7 }, { name: "H", code: 8 },
+  { name: "I", code: 9 }, { name: "J", code: 10 }, { name: "K", code: 11 }, { name: "L", code: 12 },
+  { name: "M", code: 13 }, { name: "N", code: 14 }, { name: "O", code: 15 }, { name: "P", code: 16 },
+  { name: "Q", code: 17 }, { name: "R", code: 18 }, { name: "S", code: 19 }, { name: "T", code: 20 },
+  { name: "U", code: 21 }, { name: "V", code: 22 }, { name: "W", code: 23 }, { name: "X", code: 24 },
+  { name: "Y", code: 25 }, { name: "Z", code: 26 },
+  { name: "F1", code: 61 }, { name: "F2", code: 62 }, { name: "F3", code: 63 }, { name: "F4", code: 64 },
+  { name: "F5", code: 65 }, { name: "F6", code: 66 }, { name: "F7", code: 67 }, { name: "F8", code: 68 },
+  { name: "F9", code: 69 }, { name: "F10", code: 70 }, { name: "F11", code: 71 }, { name: "F12", code: 72 }
+];
+
 function App() {
   const [localInfo, setLocalInfo] = useState<LocalInfo>({ hostname: "Определение...", ip: "127.0.0.1" });
   const [interfaces, setInterfaces] = useState<NetworkInterface[]>([]);
@@ -62,11 +78,57 @@ function App() {
   // Settings Dialog Ref
   const settingsDialogRef = useRef<HTMLDialogElement>(null);
   const [copied, setCopied] = useState(false);
+  const [copiedLogs, setCopiedLogs] = useState(false);
+  const [clearedLogs, setClearedLogs] = useState(false);
 
   // KVM Settings
   const [kvmEnabled, setKvmEnabled] = useState(false);
   const [borderDirection, setBorderDirection] = useState<1 | 0>(1); // 1 = Right, 0 = Left
   const [accessibilityGranted, setAccessibilityGranted] = useState(true);
+
+  // KVM Configurable Hotkeys state
+  const [hotkeyCtrl, setHotkeyCtrl] = useState<boolean>(() => {
+    return localStorage.getItem("hotkeyCtrl") !== "false"; // defaults to true
+  });
+  const [hotkeyAlt, setHotkeyAlt] = useState<boolean>(() => {
+    return localStorage.getItem("hotkeyAlt") !== "false"; // defaults to true
+  });
+  const [hotkeyShift, setHotkeyShift] = useState<boolean>(() => {
+    return localStorage.getItem("hotkeyShift") === "true"; // defaults to false
+  });
+  const [hotkeyKeyCode, setHotkeyKeyCode] = useState<number>(() => {
+    const saved = localStorage.getItem("hotkeyKeyCode");
+    return saved ? parseInt(saved, 10) : 11; // defaults to 11 (KeyK)
+  });
+
+  // Sync hotkey with Rust backend whenever it changes
+  useEffect(() => {
+    localStorage.setItem("hotkeyCtrl", String(hotkeyCtrl));
+    localStorage.setItem("hotkeyAlt", String(hotkeyAlt));
+    localStorage.setItem("hotkeyShift", String(hotkeyShift));
+    localStorage.setItem("hotkeyKeyCode", String(hotkeyKeyCode));
+
+    invoke("set_kvm_hotkey", {
+      ctrl: hotkeyCtrl,
+      alt: hotkeyAlt,
+      shift: hotkeyShift,
+      keyCode: hotkeyKeyCode
+    }).catch((err) => console.error("Failed to sync hotkey with backend:", err));
+  }, [hotkeyCtrl, hotkeyAlt, hotkeyShift, hotkeyKeyCode]);
+
+  const getHotkeyString = () => {
+    const parts = [];
+    if (hotkeyCtrl) parts.push("Ctrl");
+    if (hotkeyAlt) parts.push("Alt");
+    if (hotkeyShift) parts.push("Shift");
+    const keyMatch = KEYS_LIST.find((k) => k.code === hotkeyKeyCode);
+    if (keyMatch) {
+      parts.push(keyMatch.name);
+    } else {
+      parts.push("?");
+    }
+    return parts.join(" + ");
+  };
 
   // KVM Status
   const [kvmStatus, setKvmStatus] = useState<KvmStatusUpdate>({ active: false, role: "idle", target: "" });
@@ -82,6 +144,41 @@ function App() {
     navigator.clipboard.writeText(`http://${activeIp}:53203`);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleDownloadLogs = async () => {
+    try {
+      const saved = await invoke<boolean>("save_log_file");
+      if (saved) {
+        alert("Файл логов успешно сохранен!");
+      }
+    } catch (err: any) {
+      alert("Не удалось сохранить логи: " + err.toString());
+    }
+  };
+
+  const handleCopyLogs = async () => {
+    try {
+      const content = await invoke<string>("get_log_content");
+      await navigator.clipboard.writeText(content);
+      setCopiedLogs(true);
+      setTimeout(() => setCopiedLogs(false), 2000);
+    } catch (err: any) {
+      alert("Не удалось скопировать логи: " + err.toString());
+    }
+  };
+
+  const handleClearLogs = async () => {
+    if (!window.confirm("Вы уверены, что хотите очистить файл логов?")) {
+      return;
+    }
+    try {
+      await invoke("clear_logs");
+      setClearedLogs(true);
+      setTimeout(() => setClearedLogs(false), 2000);
+    } catch (err: any) {
+      alert("Не удалось очистить логи: " + err.toString());
+    }
   };
   
   // Fetch Local Machine Info and Discovered Peers
@@ -549,10 +646,16 @@ function App() {
 
                   <div className="h-[1px] bg-neutral-900" />
                   
-                  {/* Failsafe Notice */}
-                  <div className="text-[10px] text-neutral-500 flex gap-2">
-                    <Info className="w-4 h-4 text-indigo-400 shrink-0" />
-                    <span>Для экстренного возврата курсора нажмите <strong>Ctrl + Alt + Escape</strong></span>
+                  {/* Failsafe & Toggle Notice */}
+                  <div className="flex flex-col gap-2 bg-neutral-950/30 p-3.5 rounded-2xl border border-neutral-900/60">
+                    <div className="text-[10px] text-neutral-400 flex items-center gap-2">
+                      <Keyboard className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                      <span>Горячая клавиша переключения: <strong className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-850 text-indigo-300 font-mono text-[9px] select-none uppercase tracking-wide">{getHotkeyString()}</strong></span>
+                    </div>
+                    <div className="text-[10px] text-neutral-500 flex items-center gap-2">
+                      <Info className="w-3.5 h-3.5 text-neutral-600 shrink-0" />
+                      <span>Экстренный сброс: <strong className="font-mono text-neutral-400 text-[9px]">Ctrl + Alt + Escape</strong></span>
+                    </div>
                   </div>
 
                   <div className="flex gap-2">
@@ -774,7 +877,75 @@ function App() {
               </div>
             </div>
 
-            {/* Section 2: iOS/Android Web Portal */}
+            {/* Section 2: KVM Hotkey Configuration */}
+            <div className="flex flex-col gap-3 border-t border-neutral-900 pt-5">
+              <h4 className="text-[10px] font-extrabold text-indigo-400 uppercase tracking-wider flex items-center gap-1.5">
+                <Keyboard className="w-3.5 h-3.5" /> Горячие клавиши KVM
+              </h4>
+              <p className="text-xs text-neutral-400 leading-relaxed">
+                Настройте клавиатурную комбинацию для мгновенного перехвата и возврата мыши и ввода.
+              </p>
+              <div className="bg-neutral-950/40 border border-neutral-900 rounded-2xl p-4 flex flex-col gap-4">
+                
+                {/* Modifiers Checkboxes */}
+                <div className="flex items-center gap-4">
+                  <label className="flex items-center gap-2 cursor-pointer select-none text-xs text-neutral-300">
+                    <input 
+                      type="checkbox" 
+                      checked={hotkeyCtrl} 
+                      onChange={(e) => setHotkeyCtrl(e.target.checked)}
+                      className="w-4 h-4 rounded border-neutral-800 bg-neutral-900 text-indigo-600 focus:ring-0 focus:ring-offset-0"
+                    />
+                    <span>Ctrl</span>
+                  </label>
+                  
+                  <label className="flex items-center gap-2 cursor-pointer select-none text-xs text-neutral-300">
+                    <input 
+                      type="checkbox" 
+                      checked={hotkeyAlt} 
+                      onChange={(e) => setHotkeyAlt(e.target.checked)}
+                      className="w-4 h-4 rounded border-neutral-800 bg-neutral-900 text-indigo-600 focus:ring-0 focus:ring-offset-0"
+                    />
+                    <span>Alt</span>
+                  </label>
+                  
+                  <label className="flex items-center gap-2 cursor-pointer select-none text-xs text-neutral-300">
+                    <input 
+                      type="checkbox" 
+                      checked={hotkeyShift} 
+                      onChange={(e) => setHotkeyShift(e.target.checked)}
+                      className="w-4 h-4 rounded border-neutral-800 bg-neutral-900 text-indigo-600 focus:ring-0 focus:ring-offset-0"
+                    />
+                    <span>Shift</span>
+                  </label>
+                </div>
+
+                {/* Key Dropdown Selection */}
+                <div className="flex items-center justify-between gap-4">
+                  <span className="text-neutral-400 text-xs font-medium shrink-0">Клавиша активации:</span>
+                  <select
+                    value={hotkeyKeyCode}
+                    onChange={(e) => setHotkeyKeyCode(parseInt(e.target.value, 10))}
+                    className="flex-1 bg-neutral-900 border border-neutral-800 rounded-xl px-3.5 py-2 text-xs text-neutral-200 outline-none hover:border-neutral-700 transition"
+                  >
+                    {KEYS_LIST.map((key) => (
+                      <option key={key.code} value={key.code}>
+                        {key.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Preview Badge */}
+                <div className="flex items-center justify-between text-xs pt-1 border-t border-neutral-900/40">
+                  <span className="text-neutral-500 font-mono text-[10px] uppercase font-bold">Выбранная комбинация:</span>
+                  <span className="px-2 py-0.5 rounded bg-neutral-900 border border-neutral-850 text-indigo-300 font-mono font-bold text-[10px] uppercase tracking-wider">{getHotkeyString()}</span>
+                </div>
+
+              </div>
+            </div>
+
+            {/* Section 3: iOS/Android Web Portal */}
             <div className="flex flex-col gap-3">
               <h4 className="text-[10px] font-extrabold text-indigo-400 uppercase tracking-wider flex items-center gap-1.5">
                 <Wifi className="w-3.5 h-3.5" /> Мобильный Веб-портал
@@ -818,7 +989,50 @@ function App() {
               </div>
             </div>
 
-            {/* Section 3: About Developer */}
+            {/* Section 3: Application Logs */}
+            <div className="flex flex-col gap-3 border-t border-neutral-900 pt-5">
+              <h4 className="text-[10px] font-extrabold text-indigo-400 uppercase tracking-wider flex items-center gap-1.5">
+                <FileText className="w-3.5 h-3.5" /> Логи приложения
+              </h4>
+              <p className="text-xs text-neutral-400 leading-relaxed">
+                Вы можете сохранить файл логов (.txt) для анализа ошибок и крашей, скопировать их в буфер обмена или очистить.
+              </p>
+              <div className="bg-neutral-950/60 border border-neutral-900 rounded-2xl p-4 flex flex-col gap-3">
+                <div className="flex gap-2.5 w-full">
+                  <button 
+                    onClick={handleDownloadLogs}
+                    className="flex-1 inline-flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-bold uppercase tracking-wider transition-all shadow-md shadow-indigo-900/10 active-depress"
+                  >
+                    <FileText className="w-3.5 h-3.5" />
+                    Скачать логи
+                  </button>
+                  <button 
+                    onClick={handleCopyLogs}
+                    className={`flex-1 inline-flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl border text-[10px] font-bold uppercase tracking-wider transition-all active-depress ${
+                      copiedLogs 
+                        ? "border-emerald-500 bg-emerald-500/10 text-emerald-400" 
+                        : "border-neutral-850 bg-neutral-900 hover:bg-neutral-800 text-neutral-300"
+                    }`}
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                    {copiedLogs ? "Готово!" : "Копировать"}
+                  </button>
+                  <button 
+                    onClick={handleClearLogs}
+                    className={`flex-1 inline-flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl border text-[10px] font-bold uppercase tracking-wider transition-all active-depress ${
+                      clearedLogs
+                        ? "border-emerald-500 bg-emerald-500/10 text-emerald-400"
+                        : "border-neutral-850 bg-neutral-900 hover:bg-neutral-800 text-neutral-300"
+                    }`}
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    {clearedLogs ? "Очищено!" : "Очистить"}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Section 4: About Developer */}
             <div className="flex flex-col gap-3 border-t border-neutral-900 pt-5">
               <h4 className="text-[10px] font-extrabold text-indigo-400 uppercase tracking-wider">О разработчике</h4>
               <div className="bg-neutral-950/40 border border-neutral-900 rounded-2xl p-5 flex flex-col items-center text-center relative overflow-hidden">
@@ -855,7 +1069,7 @@ function App() {
 
       {/* Footer */}
       <footer className="py-5 border-t border-neutral-950 bg-neutral-950/40 text-center text-[10px] text-neutral-600 font-mono tracking-wider z-10">
-        DeskBridge v2.1.0 • Прямое P2P и KVM по локальной сети без облачных серверов
+        DeskBridge v2.2.0 • Прямое P2P и KVM по локальной сети без облачных серверов
       </footer>
     </div>
   );

@@ -2,12 +2,56 @@ use rdev::{simulate, display_size, Button, Event, EventType, Key};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
+use std::fs::{File, OpenOptions};
+use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
 use serde::Serialize;
-use mouse_position::mouse_position::Mouse;
+
+// --- Thread-safe Global File Logger ---
+pub static LOG_FILE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+fn get_timestamp() -> String {
+    if let Ok(elapsed) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        let secs = elapsed.as_secs();
+        let hours = (secs / 3600) % 24;
+        let mins = (secs / 60) % 60;
+        let seconds = secs % 60;
+        let millis = elapsed.subsec_millis();
+        format!("{:02}:{:02}:{:02}.{:03}", hours, mins, seconds, millis)
+    } else {
+        "00:00:00.000".to_string()
+    }
+}
+
+pub fn init_logger(app_handle: &AppHandle) {
+    use tauri::Manager;
+    let log_dir = app_handle.path().app_log_dir().unwrap_or_else(|_| {
+        dirs::home_dir().map(|h| h.join(".deskbridge")).unwrap_or_else(|| PathBuf::from("."))
+    });
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_file = log_dir.join("deskbridge.log");
+    let _ = LOG_FILE_PATH.set(log_file.clone());
+    
+    if let Ok(mut f) = File::create(&log_file) {
+        let _ = f.write_all(format!("=== DeskBridge Session Started at UTC ===\n").as_bytes());
+    }
+    log_write("INFO", &format!("Logger initialized. Log path: {:?}", log_file));
+}
+
+pub fn log_write(level: &str, message: &str) {
+    let ts = get_timestamp();
+    let line = format!("[{}] [{}] {}\n", ts, level, message);
+    print!("{}", line);
+    
+    if let Some(path) = LOG_FILE_PATH.get() {
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
 
 // --- Atomic State Variables ---
 pub static KVM_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -17,12 +61,19 @@ pub static BORDER_DIRECTION: AtomicU8 = AtomicU8::new(1); // 1 = Right, 0 = Left
 pub static SCREEN_WIDTH: AtomicU16 = AtomicU16::new(1920);
 pub static SCREEN_HEIGHT: AtomicU16 = AtomicU16::new(1080);
 
+// Configurable hotkey settings (Defaults to Ctrl + Alt + K)
+pub static HOTKEY_CTRL: AtomicBool = AtomicBool::new(true);
+pub static HOTKEY_ALT: AtomicBool = AtomicBool::new(true);
+pub static HOTKEY_SHIFT: AtomicBool = AtomicBool::new(false);
+pub static HOTKEY_KEY: AtomicU16 = AtomicU16::new(11); // 11 corresponds to KeyK
+
 // Flag to prevent multiple concurrent connection attempts
 pub static IS_CONNECTING: AtomicBool = AtomicBool::new(false);
 
-// Modifier keys tracking for failsafe release hotkey (Ctrl + Alt + Escape)
+// Modifier keys tracking for failsafe release hotkey and custom hotkey
 static CTRL_PRESSED: AtomicBool = AtomicBool::new(false);
 static ALT_PRESSED: AtomicBool = AtomicBool::new(false);
+static SHIFT_PRESSED: AtomicBool = AtomicBool::new(false);
 
 // We store the target IP address when KVM is triggered
 static TARGET_IP: OnceLock<std::sync::Mutex<String>> = OnceLock::new();
@@ -135,6 +186,64 @@ fn grab_callback(event: Event) -> Option<Event> {
         return Some(event);
     }
 
+    // --- Track modifier key states globally (active or inactive) ---
+    match event.event_type {
+        EventType::KeyPress(key) => {
+            if key == Key::ControlLeft || key == Key::ControlRight {
+                CTRL_PRESSED.store(true, Ordering::SeqCst);
+            } else if key == Key::Alt || key == Key::AltGr {
+                ALT_PRESSED.store(true, Ordering::SeqCst);
+            } else if key == Key::ShiftLeft || key == Key::ShiftRight {
+                SHIFT_PRESSED.store(true, Ordering::SeqCst);
+            }
+            
+            // Failsafe key check: Ctrl + Alt + Escape (only when active)
+            if KVM_ACTIVE.load(Ordering::SeqCst) && key == Key::Escape && CTRL_PRESSED.load(Ordering::SeqCst) && ALT_PRESSED.load(Ordering::SeqCst) {
+                log_write("INFO", "KVM Host: Failsafe release hotkey Ctrl+Alt+Esc triggered!");
+                KVM_ACTIVE.store(false, Ordering::SeqCst);
+                return None;
+            }
+
+            // Custom toggle hotkey check
+            let code = key_to_u16(key);
+            let target_code = HOTKEY_KEY.load(Ordering::SeqCst);
+            if code == target_code
+                && CTRL_PRESSED.load(Ordering::SeqCst) == HOTKEY_CTRL.load(Ordering::SeqCst)
+                && ALT_PRESSED.load(Ordering::SeqCst) == HOTKEY_ALT.load(Ordering::SeqCst)
+                && SHIFT_PRESSED.load(Ordering::SeqCst) == HOTKEY_SHIFT.load(Ordering::SeqCst)
+            {
+                if KVM_ACTIVE.load(Ordering::SeqCst) {
+                    log_write("INFO", "KVM Host: Custom hotkey triggered - Releasing control.");
+                    KVM_ACTIVE.store(false, Ordering::SeqCst);
+                } else {
+                    let target = get_target_ip();
+                    if !target.is_empty() && !IS_CONNECTING.load(Ordering::SeqCst) {
+                        log_write("INFO", "KVM Host: Custom hotkey triggered - Initiating KVM session.");
+                        IS_CONNECTING.store(true, Ordering::SeqCst);
+                        let ip = target.clone();
+                        if let Some(app_handle) = APP_HANDLE.get() {
+                            let app_clone = app_handle.clone();
+                            thread::spawn(move || {
+                                initiate_kvm_control_session(app_clone, ip);
+                            });
+                        }
+                    }
+                }
+                return None; // swallow hotkey
+            }
+        }
+        EventType::KeyRelease(key) => {
+            if key == Key::ControlLeft || key == Key::ControlRight {
+                CTRL_PRESSED.store(false, Ordering::SeqCst);
+            } else if key == Key::Alt || key == Key::AltGr {
+                ALT_PRESSED.store(false, Ordering::SeqCst);
+            } else if key == Key::ShiftLeft || key == Key::ShiftRight {
+                SHIFT_PRESSED.store(false, Ordering::SeqCst);
+            }
+        }
+        _ => {}
+    }
+
     if !KVM_ACTIVE.load(Ordering::SeqCst) {
         // --- Edge Detection ---
         if let EventType::MouseMove { x, y: _ } = event.event_type {
@@ -200,32 +309,14 @@ fn grab_callback(event: Event) -> Option<Event> {
             let _ = simulate(&EventType::MouseMove { x: cx, y: cy });
         }
         EventType::KeyPress(key) => {
-            // Track modifier states
-            if key == Key::ControlLeft || key == Key::ControlRight {
-                CTRL_PRESSED.store(true, Ordering::SeqCst);
-            } else if key == Key::Alt || key == Key::AltGr {
-                ALT_PRESSED.store(true, Ordering::SeqCst);
-            } else if key == Key::Escape {
-                if CTRL_PRESSED.load(Ordering::SeqCst) && ALT_PRESSED.load(Ordering::SeqCst) {
-                    println!("KVM: Failsafe release hotkey Ctrl+Alt+Esc triggered!");
-                    KVM_ACTIVE.store(false, Ordering::SeqCst);
-                    return None;
-                }
-            }
-
+            // Modifiers are already tracked globally above
             let key_code = key_to_u16(key);
             payload.push(1); // 1 = PressKey
             payload.extend_from_slice(&key_code.to_le_bytes());
             payload.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // padding
         }
         EventType::KeyRelease(key) => {
-            // Track modifier states
-            if key == Key::ControlLeft || key == Key::ControlRight {
-                CTRL_PRESSED.store(false, Ordering::SeqCst);
-            } else if key == Key::Alt || key == Key::AltGr {
-                ALT_PRESSED.store(false, Ordering::SeqCst);
-            }
-
+            // Modifiers are already tracked globally above
             let key_code = key_to_u16(key);
             payload.push(2); // 2 = ReleaseKey
             payload.extend_from_slice(&key_code.to_le_bytes());
@@ -278,9 +369,9 @@ fn grab_callback(event: Event) -> Option<Event> {
 pub fn init_kvm_listener(app_handle: AppHandle) {
     let _ = APP_HANDLE.set(app_handle);
     thread::spawn(|| {
-        println!("Starting global input capture listener thread...");
+        log_write("INFO", "Starting global input capture listener thread...");
         if let Err(e) = rdev::grab(grab_callback) {
-            eprintln!("Failed to register rdev grab hook: {:?}", e);
+            log_write("ERROR", &format!("Failed to register rdev grab hook: {:?}", e));
         }
     });
 }
@@ -301,7 +392,7 @@ fn set_active_sender(sender: Option<std::sync::mpsc::Sender<Vec<u8>>>) {
 // Let's correct initiate_kvm_control_session:
 fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
     let address = format!("{}:53201", ip);
-    println!("KVM: Connecting to Client at {}...", address);
+    log_write("INFO", &format!("KVM Host: Connecting to Client at {}...", address));
 
     match TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_secs(3)) {
         Ok(stream) => {
@@ -338,7 +429,7 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                         Ok(data) => {
                             idle_ticks = 0;
                             if let Err(e) = writer_socket.write_all(&data) {
-                                eprintln!("KVM Server: Error writing to socket: {:?}", e);
+                                log_write("ERROR", &format!("KVM Host: Error writing to socket: {:?}", e));
                                 break;
                             }
                         }
@@ -348,7 +439,7 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                                 idle_ticks = 0;
                                 let keepalive = [7u8, 0, 0, 0, 0, 0, 0, 0, 0];
                                 if let Err(e) = writer_socket.write_all(&keepalive) {
-                                    eprintln!("KVM Server: Keepalive failed: {:?}", e);
+                                    log_write("ERROR", &format!("KVM Host: Keepalive write failed: {:?}", e));
                                     break;
                                 }
                             }
@@ -360,7 +451,7 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                 }
                 
                 // Connection closed or KVM stopped
-                println!("KVM Server: Control session ended.");
+                log_write("INFO", "KVM Host: Control session ended.");
                 KVM_ACTIVE.store(false, Ordering::SeqCst);
                 set_active_sender(None);
                 
@@ -386,13 +477,13 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                         Ok(_) => {
                             if buf[0] == 6 {
                                 // Received ReleaseControl!
-                                println!("KVM Server: Client requested release of control.");
+                                log_write("INFO", "KVM Host: Client requested release of control.");
                                 KVM_ACTIVE.store(false, Ordering::SeqCst);
                                 break;
                             }
                         }
                         Err(e) => {
-                            eprintln!("KVM Server Reader: socket disconnected: {:?}", e);
+                            log_write("INFO", &format!("KVM Host Reader: Socket disconnected: {:?}", e));
                             KVM_ACTIVE.store(false, Ordering::SeqCst);
                             break;
                         }
@@ -401,7 +492,7 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
             });
         }
         Err(e) => {
-            eprintln!("KVM Server: Failed to connect to Client {}: {:?}", address, e);
+            log_write("ERROR", &format!("KVM Host: Failed to connect to Client {}: {:?}", address, e));
             IS_CONNECTING.store(false, Ordering::SeqCst);
         }
     }
@@ -410,8 +501,13 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
 // --- KVM Client (Receiver) Listening Server ---
 pub fn start_kvm_client_server(app_handle: AppHandle) {
     thread::spawn(move || {
-        let listener = TcpListener::bind("0.0.0.0:53201").expect("Failed to bind KVM Client port");
-        println!("KVM Client listening for connections on port 53201...");
+        let listener = TcpListener::bind("0.0.0.0:53201");
+        if let Err(e) = &listener {
+            log_write("ERROR", &format!("Failed to bind KVM Client port 53201: {:?}", e));
+            return;
+        }
+        let listener = listener.unwrap();
+        log_write("INFO", "KVM Client: Listening for host KVM connections on port 53201...");
 
         for stream in listener.incoming() {
             match stream {
@@ -420,7 +516,7 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                     socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
 
                     let peer_addr = socket.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-                    println!("KVM Client: Connected by Host: {}", peer_addr);
+                    log_write("INFO", &format!("KVM Client: Connected by Host at {}", peer_addr));
 
                     let _ = app_handle.emit("kvm-status", KvmStatusUpdate {
                         active: true,
@@ -432,119 +528,124 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                     let (w, h) = get_screen_size();
                     let mut current_x = w / 2.0;
                     let mut current_y = h / 2.0;
-                    let _ = simulate(&EventType::MouseMove { x: current_x, y: current_y });
+                    if let Err(e) = simulate(&EventType::MouseMove { x: current_x, y: current_y }) {
+                        log_write("ERROR", &format!("KVM Client: Failed to simulate initial MouseMove: {:?}", e));
+                    }
 
                     let mut write_socket = socket.try_clone().unwrap();
                     let mut buf = [0u8; 9];
                     
                     let mut controlled = true;
+                    log_write("INFO", "KVM Client: Control session started.");
+
                     while controlled {
                         match socket.read_exact(&mut buf) {
                             Ok(_) => {
                                 let event_type = buf[0];
                                 match event_type {
                                     0 => {
-                                        // MouseMove: DX (f32), DY (f32)
-                                        let dx = f32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
-                                        let dy = f32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
+                                         // MouseMove: DX (f32), DY (f32)
+                                         let dx = f32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
+                                         let dy = f32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
 
-                                        // Query current cursor coordinates to be robust
-                                        let pos = Mouse::get_mouse_position();
-                                        if let Mouse::Position { x, y } = pos {
-                                            current_x = x as f64;
-                                            current_y = y as f64;
-                                        }
+                                         // We NO LONGER query Mouse::get_mouse_position() because it can fail or return (0, 0)
+                                         // on macOS due to lack of window focus or sandbox restrictions, causing coordinate corruptions.
+                                         // Relying purely on accumulated memory coordinates is 100% stable and smooth.
+                                         current_x += dx as f64;
+                                         current_y += dy as f64;
 
-                                        current_x += dx as f64;
-                                        current_y += dy as f64;
+                                         // Boundary Clamping and Release Control Check
+                                         let direction = BORDER_DIRECTION.load(Ordering::SeqCst);
+                                         let (w, h) = get_screen_size();
+                                         let client_limit_triggered = if direction == 1 {
+                                             // Host screen is on the LEFT, client screen is on the RIGHT.
+                                             // If remote mouse moves off the LEFT border, return control to host.
+                                             current_x <= 2.0 && dx < 0.0
+                                         } else {
+                                             // Host screen is on the RIGHT, client screen is on the LEFT.
+                                             // If remote mouse moves off the RIGHT border, return control.
+                                             current_x >= w - 2.0 && dx > 0.0
+                                         };
 
-                                        // Boundary Clamping and Release Control Check
-                                        let direction = BORDER_DIRECTION.load(Ordering::SeqCst);
-                                        let (w, h) = get_screen_size();
-                                        let client_limit_triggered = if direction == 1 {
-                                            // Host screen is on the LEFT, client screen is on the RIGHT.
-                                            // If remote mouse moves off the LEFT border, return control to host.
-                                            if current_x <= 2.0 && dx < 0.0 {
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        } else {
-                                            // Host screen is on the RIGHT, client screen is on the LEFT.
-                                            // If remote mouse moves off the RIGHT border, return control.
-                                            if current_x >= w - 2.0 && dx > 0.0 {
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        };
-
-                                        if client_limit_triggered {
-                                            println!("KVM Client: Boundary reached. Returning control to Host.");
-                                            // Send ReleaseControl command back to Host
-                                            let release_packet = [6u8, 0, 0, 0, 0, 0, 0, 0, 0];
-                                            let _ = write_socket.write_all(&release_packet);
-                                            controlled = false;
-                                        } else {
-                                            // Clamp values to screen size
-                                            current_x = current_x.clamp(0.0, w);
-                                            current_y = current_y.clamp(0.0, h);
-                                            let _ = simulate(&EventType::MouseMove { x: current_x, y: current_y });
-                                        }
+                                         if client_limit_triggered {
+                                             log_write("INFO", "KVM Client: Screen boundary reached. Releasing control back to Host.");
+                                             // Send ReleaseControl command back to Host
+                                             let release_packet = [6u8, 0, 0, 0, 0, 0, 0, 0, 0];
+                                             let _ = write_socket.write_all(&release_packet);
+                                             controlled = false;
+                                         } else {
+                                             // Clamp values to screen size
+                                             current_x = current_x.clamp(0.0, w);
+                                             current_y = current_y.clamp(0.0, h);
+                                             if let Err(e) = simulate(&EventType::MouseMove { x: current_x, y: current_y }) {
+                                                 log_write("ERROR", &format!("KVM Client: Failed to simulate MouseMove: {:?}", e));
+                                             }
+                                         }
                                     }
                                     1 => {
-                                        // KeyPress
-                                        let val = u16::from_le_bytes([buf[1], buf[2]]);
-                                        let key = u16_to_key(val);
-                                        let _ = simulate(&EventType::KeyPress(key));
+                                         // KeyPress
+                                         let val = u16::from_le_bytes([buf[1], buf[2]]);
+                                         let key = u16_to_key(val);
+                                         if let Err(e) = simulate(&EventType::KeyPress(key)) {
+                                             log_write("ERROR", &format!("KVM Client: Failed to simulate KeyPress: {:?}", e));
+                                         }
                                     }
                                     2 => {
-                                        // KeyRelease
-                                        let val = u16::from_le_bytes([buf[1], buf[2]]);
-                                        let key = u16_to_key(val);
-                                        let _ = simulate(&EventType::KeyRelease(key));
+                                         // KeyRelease
+                                         let val = u16::from_le_bytes([buf[1], buf[2]]);
+                                         let key = u16_to_key(val);
+                                         if let Err(e) = simulate(&EventType::KeyRelease(key)) {
+                                             log_write("ERROR", &format!("KVM Client: Failed to simulate KeyRelease: {:?}", e));
+                                         }
                                     }
                                     3 => {
-                                        // ButtonPress
-                                        let btn_id = buf[1];
-                                        let btn = match btn_id {
-                                            0 => Button::Left,
-                                            1 => Button::Right,
-                                            2 => Button::Middle,
-                                            code => Button::Unknown(code),
-                                        };
-                                        let _ = simulate(&EventType::ButtonPress(btn));
+                                         // ButtonPress
+                                         let btn_id = buf[1];
+                                         let btn = match btn_id {
+                                             0 => Button::Left,
+                                             1 => Button::Right,
+                                             2 => Button::Middle,
+                                             code => Button::Unknown(code),
+                                         };
+                                         if let Err(e) = simulate(&EventType::ButtonPress(btn)) {
+                                             log_write("ERROR", &format!("KVM Client: Failed to simulate ButtonPress: {:?}", e));
+                                         }
                                     }
                                     4 => {
-                                        // ButtonRelease
-                                        let btn_id = buf[1];
-                                        let btn = match btn_id {
-                                            0 => Button::Left,
-                                            1 => Button::Right,
-                                            2 => Button::Middle,
-                                            code => Button::Unknown(code),
-                                        };
-                                        let _ = simulate(&EventType::ButtonRelease(btn));
+                                         // ButtonRelease
+                                         let btn_id = buf[1];
+                                         let btn = match btn_id {
+                                             0 => Button::Left,
+                                             1 => Button::Right,
+                                             2 => Button::Middle,
+                                             code => Button::Unknown(code),
+                                         };
+                                         if let Err(e) = simulate(&EventType::ButtonRelease(btn)) {
+                                             log_write("ERROR", &format!("KVM Client: Failed to simulate ButtonRelease: {:?}", e));
+                                         }
                                     }
                                     5 => {
-                                        // Wheel
-                                        let dx = i32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
-                                        let dy = i32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
-                                        let _ = simulate(&EventType::Wheel { delta_x: dx as i64, delta_y: dy as i64 });
+                                         // Wheel
+                                         let dx = i32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
+                                         let dy = i32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
+                                         if let Err(e) = simulate(&EventType::Wheel { delta_x: dx as i64, delta_y: dy as i64 }) {
+                                             log_write("ERROR", &format!("KVM Client: Failed to simulate Wheel: {:?}", e));
+                                         }
                                     }
                                     7 => {
-                                        // Heartbeat keepalive, do nothing
+                                         // Heartbeat keepalive, do nothing
                                     }
                                     _ => {}
                                 }
                             }
                             Err(e) => {
-                                println!("KVM Client: Host disconnected or read timeout: {:?}", e);
+                                log_write("INFO", &format!("KVM Client: Host disconnected or read timeout: {:?}", e));
                                 controlled = false;
                             }
                         }
                     }
 
+                    log_write("INFO", "KVM Client: Control session ended.");
                     let _ = app_handle.emit("kvm-status", KvmStatusUpdate {
                         active: false,
                         role: "idle".to_string(),
@@ -552,7 +653,7 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                     });
                 }
                 Err(e) => {
-                    eprintln!("KVM Client connection error: {:?}", e);
+                    log_write("ERROR", &format!("KVM Client: Connection accept error: {:?}", e));
                 }
             }
         }
@@ -574,8 +675,8 @@ pub fn configure_kvm(enabled: bool, target_ip: String, screen_w: u16, screen_h: 
     BORDER_X.store(border_x, Ordering::SeqCst);
     BORDER_DIRECTION.store(direction, Ordering::SeqCst);
 
-    println!("KVM Configured: Enabled: {}, Target: {}, Screen: {}x{}, BorderX: {}, Dir: {}",
-             enabled, get_target_ip(), screen_w, screen_h, border_x, direction);
+    log_write("INFO", &format!("KVM Configured: Enabled: {}, Target: {}, Screen: {}x{}, BorderX: {}, Dir: {}",
+             enabled, get_target_ip(), screen_w, screen_h, border_x, direction));
 
     Ok("success".to_string())
 }
@@ -603,3 +704,14 @@ pub fn release_manual_control() -> Result<String, String> {
     KVM_ACTIVE.store(false, Ordering::SeqCst);
     Ok("control_released".to_string())
 }
+
+#[tauri::command]
+pub fn set_kvm_hotkey(ctrl: bool, alt: bool, shift: bool, key_code: u16) -> Result<(), String> {
+    HOTKEY_CTRL.store(ctrl, Ordering::SeqCst);
+    HOTKEY_ALT.store(alt, Ordering::SeqCst);
+    HOTKEY_SHIFT.store(shift, Ordering::SeqCst);
+    HOTKEY_KEY.store(key_code, Ordering::SeqCst);
+    log_write("INFO", &format!("KVM Hotkey updated: Ctrl={}, Alt={}, Shift={}, KeyCode={}", ctrl, alt, shift, key_code));
+    Ok(())
+}
+

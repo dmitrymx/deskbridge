@@ -40,7 +40,7 @@ pub fn start_mdns(app: AppHandle, local_port: u16) {
         .map(|ip| ip.to_string())
         .unwrap_or_else(|_| "127.0.0.1".to_string());
 
-    println!("Registering mDNS: Hostname: {}, IP: {}, Port: {}", hostname, local_ip, local_port);
+    crate::kvm::log_write("INFO", &format!("Registering mDNS: Hostname: {}, IP: {}, Port: {}", hostname, local_ip, local_port));
 
     // Clean up hostname to make a valid service instance name
     let clean_hostname = hostname.replace('.', "_");
@@ -89,7 +89,7 @@ pub fn start_mdns(app: AppHandle, local_port: u16) {
                         port,
                     };
 
-                    println!("mDNS: Resolved neighboring DeskBridge node: {:?}", node);
+                    crate::kvm::log_write("INFO", &format!("mDNS: Resolved neighboring DeskBridge node: {:?}", node));
 
                     // Update local state list of nodes
                     let state = app_clone.state::<MdnsState>();

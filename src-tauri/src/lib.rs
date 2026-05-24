@@ -73,10 +73,61 @@ fn get_discovered_nodes(app_handle: tauri::AppHandle) -> Result<Vec<mdns::Discov
 }
 
 #[tauri::command]
-fn select_file() -> Result<Option<String>, String> {
-    let file = rfd::FileDialog::new()
-        .pick_file();
-    Ok(file.map(|f| f.to_string_lossy().to_string()))
+fn select_file(app_handle: tauri::AppHandle) -> Result<Option<String>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app_handle.run_on_main_thread(move || {
+        let file = rfd::FileDialog::new().pick_file();
+        let path_str = file.map(|f| f.to_string_lossy().to_string());
+        let _ = tx.send(path_str);
+    }).map_err(|e| e.to_string())?;
+
+    rx.recv().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_log_content() -> Result<String, String> {
+    let log_path = kvm::LOG_FILE_PATH.get().ok_or("Logger not initialized")?;
+    if !log_path.exists() {
+        return Ok("No logs recorded yet.".to_string());
+    }
+    std::fs::read_to_string(log_path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn clear_logs() -> Result<(), String> {
+    let log_path = kvm::LOG_FILE_PATH.get().ok_or("Logger not initialized")?;
+    if log_path.exists() {
+        let _ = std::fs::remove_file(log_path);
+    }
+    kvm::log_write("INFO", "Logs cleared by user.");
+    Ok(())
+}
+
+#[tauri::command]
+fn save_log_file(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let log_path = kvm::LOG_FILE_PATH.get().ok_or("Logger not initialized")?.clone();
+    if !log_path.exists() {
+        return Err("Log file does not exist yet".to_string());
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    app_handle.run_on_main_thread(move || {
+        let file = rfd::FileDialog::new()
+            .set_file_name("deskbridge.log")
+            .add_filter("Log Files", &["log", "txt"])
+            .save_file();
+        let path_str = file.map(|f| f.to_string_lossy().to_string());
+        let _ = tx.send(path_str);
+    }).map_err(|e| e.to_string())?;
+
+    let dest_path_str = rx.recv().map_err(|e| e.to_string())?;
+    if let Some(dest_path_str) = dest_path_str {
+        let dest_path = std::path::Path::new(&dest_path_str);
+        std::fs::copy(&log_path, dest_path).map_err(|e| e.to_string())?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -86,6 +137,9 @@ pub fn run() {
         .manage(MdnsState::new())
         .setup(|app| {
             let handle = app.handle().clone();
+            
+            // Initialize global logger
+            kvm::init_logger(&handle);
             
             // Start mDNS scan and register local service on port 53200
             mdns::start_mdns(handle.clone(), 53200);
@@ -108,12 +162,16 @@ pub fn run() {
             kvm::configure_kvm,
             kvm::trigger_manual_control,
             kvm::release_manual_control,
+            kvm::set_kvm_hotkey,
             p2p::send_file,
             p2p::cancel_file_transfer,
             get_local_info,
             get_discovered_nodes,
             select_file,
-            get_network_interfaces
+            get_network_interfaces,
+            get_log_content,
+            clear_logs,
+            save_log_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

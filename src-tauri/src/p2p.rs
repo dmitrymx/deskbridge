@@ -27,19 +27,24 @@ struct FileProgressUpdate {
 /// Start the background P2P File Receiver server on port 53202
 pub fn start_p2p_file_server(app_handle: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let listener = TcpListener::bind("0.0.0.0:53202").await.expect("Failed to bind P2P file receiver port");
-        println!("P2P File Receiver listening on port 53202...");
-
-        while let Ok((mut socket, peer_addr)) = listener.accept().await {
-            let app_clone = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                let peer_ip = peer_addr.ip().to_string();
-                println!("P2P: Incoming file transfer connection from: {}", peer_ip);
-                
-                if let Err(e) = handle_incoming_file_transfer(app_clone, &mut socket).await {
-                    eprintln!("P2P Receiver Error: {:?}", e);
+        match TcpListener::bind("0.0.0.0:53202").await {
+            Ok(listener) => {
+                crate::kvm::log_write("INFO", "P2P File Receiver: Listening on port 53202...");
+                while let Ok((mut socket, peer_addr)) = listener.accept().await {
+                    let app_clone = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let peer_ip = peer_addr.ip().to_string();
+                        crate::kvm::log_write("INFO", &format!("P2P: Incoming file transfer connection from: {}", peer_ip));
+                        
+                        if let Err(e) = handle_incoming_file_transfer(app_clone, &mut socket).await {
+                            crate::kvm::log_write("ERROR", &format!("P2P Receiver Error: {:?}", e));
+                        }
+                    });
                 }
-            });
+            }
+            Err(e) => {
+                crate::kvm::log_write("ERROR", &format!("Failed to bind P2P file receiver port 53202: {:?}", e));
+            }
         }
     });
 }
@@ -72,7 +77,7 @@ async fn handle_incoming_file_transfer(app_handle: AppHandle, socket: &mut TcpSt
         .ok_or("Failed to convert filename")?
         .to_string();
 
-    println!("P2P Receiver: Receiving file: '{}' ({} bytes)", file_name, file_size);
+    crate::kvm::log_write("INFO", &format!("P2P Receiver: Receiving file: '{}' ({} bytes)", file_name, file_size));
 
     // 2. Resolve Downloads folder path
     // Get downloads directory natively
@@ -96,7 +101,7 @@ async fn handle_incoming_file_transfer(app_handle: AppHandle, socket: &mut TcpSt
         count += 1;
     }
 
-    println!("Saving file to: {:?}", target_path);
+    crate::kvm::log_write("INFO", &format!("Saving file to: {:?}", target_path));
 
     // 3. Prepare transmission loop & progress tracker
     let file = File::create(&target_path).await?;
@@ -179,7 +184,7 @@ async fn handle_incoming_file_transfer(app_handle: AppHandle, socket: &mut TcpSt
     reader.read_exact(&mut remote_hash).await?;
 
     let is_match = local_hash[..] == remote_hash[..];
-    println!("P2P: Received file verification. Checksum matched: {}", is_match);
+    crate::kvm::log_write("INFO", &format!("P2P Receiver: Received file verification. Checksum matched: {}", is_match));
 
     let total_elapsed = start_time.elapsed().as_secs_f64();
     let speed = if total_elapsed > 0.0 {
@@ -218,11 +223,17 @@ pub async fn send_file(app_handle: AppHandle, target_ip: String, file_path: Stri
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     let file_size = meta.len();
 
+    crate::kvm::log_write("INFO", &format!("P2P Sender: Starting transfer of '{}' ({} bytes) to {}", file_name, file_size, target_ip));
+
     let transfer_id = format!("send_{}", Instant::now().elapsed().as_nanos());
     
     // Connect to remote peer's file receiver port (53202)
     let address = format!("{}:53202", target_ip);
-    let mut socket = TcpStream::connect(&address).await.map_err(|e| format!("Failed to connect to remote: {}", e))?;
+    let mut socket = TcpStream::connect(&address).await.map_err(|e| {
+        let err_msg = format!("P2P Sender: Failed to connect to remote peer at {}: {}", address, e);
+        crate::kvm::log_write("ERROR", &err_msg);
+        err_msg
+    })?;
     
     let mut writer = BufWriter::new(&mut socket);
 
@@ -261,6 +272,7 @@ pub async fn send_file(app_handle: AppHandle, target_ip: String, file_path: Stri
 
     loop {
         if TRANSFER_CANCELLED.load(Ordering::SeqCst) {
+            crate::kvm::log_write("INFO", &format!("P2P Sender: Transfer of '{}' cancelled by user", file_name));
             let _ = app_handle.emit("file-progress", FileProgressUpdate {
                 transfer_id: transfer_id.clone(),
                 status: "cancelled".to_string(),
@@ -318,6 +330,8 @@ pub async fn send_file(app_handle: AppHandle, target_ip: String, file_path: Stri
         0.0
     };
 
+    crate::kvm::log_write("INFO", &format!("P2P Sender: Sent '{}' successfully in {:.2}s ({:.2} MB/s)", file_name, total_elapsed, speed));
+
     let _ = app_handle.emit("file-progress", FileProgressUpdate {
         transfer_id: transfer_id.clone(),
         status: "completed".to_string(),
@@ -340,19 +354,24 @@ pub fn cancel_file_transfer() -> Result<String, String> {
 /// Start the background Web Portal server on port 53203
 pub fn start_web_portal(app_handle: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        let listener = TcpListener::bind("0.0.0.0:53203").await.expect("Failed to bind Web Portal port");
-        println!("Web Portal listening on port 53203...");
-
-        while let Ok((socket, peer_addr)) = listener.accept().await {
-            let app_clone = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                let peer_ip = peer_addr.ip().to_string();
-                println!("Web Portal: Connection from: {}", peer_ip);
-                
-                if let Err(e) = handle_web_request(app_clone, socket).await {
-                    eprintln!("Web Portal Request Error: {:?}", e);
+        match TcpListener::bind("0.0.0.0:53203").await {
+            Ok(listener) => {
+                crate::kvm::log_write("INFO", "Web Portal: Listening on port 53203...");
+                while let Ok((socket, peer_addr)) = listener.accept().await {
+                    let app_clone = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let peer_ip = peer_addr.ip().to_string();
+                        crate::kvm::log_write("INFO", &format!("Web Portal: Incoming connection from: {}", peer_ip));
+                        
+                        if let Err(e) = handle_web_request(app_clone, socket).await {
+                            crate::kvm::log_write("ERROR", &format!("Web Portal Request Error: {:?}", e));
+                        }
+                    });
                 }
-            });
+            }
+            Err(e) => {
+                crate::kvm::log_write("ERROR", &format!("Failed to bind Web Portal port 53203: {:?}", e));
+            }
         }
     });
 }
@@ -473,7 +492,7 @@ async fn handle_web_request(app_handle: AppHandle, mut socket: TcpStream) -> Res
             count += 1;
         }
 
-        println!("Web Portal saving file to: {:?}", target_path);
+        crate::kvm::log_write("INFO", &format!("Web Portal: Saving file to: {:?}", target_path));
 
         let file = File::create(&target_path).await?;
         let mut writer = BufWriter::new(file);
