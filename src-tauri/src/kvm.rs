@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
 use serde::Serialize;
@@ -219,8 +219,47 @@ pub fn check_accessibility() -> bool {
 fn deactivate_kvm_host() {
     if KVM_ACTIVE.swap(false, Ordering::SeqCst) {
         platform_release_cursor();
-        log_write("INFO", "KVM Host: Deactivated and cursor released.");
+        release_stuck_modifiers();
+        // Set cooldown to prevent instant re-trigger from edge detection
+        DEACTIVATION_COOLDOWN.store(true, Ordering::SeqCst);
+        let _ = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(500));
+            DEACTIVATION_COOLDOWN.store(false, Ordering::SeqCst);
+        });
+        log_write("INFO", "KVM Host: Deactivated, cursor released, modifiers reset.");
     }
+}
+
+static DEACTIVATION_COOLDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Send synthetic KeyUp for all modifiers to prevent sticky keys after crash/deactivation
+#[cfg(target_os = "windows")]
+fn release_stuck_modifiers() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP};
+    unsafe {
+        keybd_event(0xA2, 0, KEYEVENTF_KEYUP, 0); // Left Ctrl
+        keybd_event(0xA3, 0, KEYEVENTF_KEYUP, 0); // Right Ctrl
+        keybd_event(0xA4, 0, KEYEVENTF_KEYUP, 0); // Left Alt
+        keybd_event(0xA5, 0, KEYEVENTF_KEYUP, 0); // Right Alt
+        keybd_event(0xA0, 0, KEYEVENTF_KEYUP, 0); // Left Shift
+        keybd_event(0xA1, 0, KEYEVENTF_KEYUP, 0); // Right Shift
+    }
+    CTRL_PRESSED.store(false, Ordering::SeqCst);
+    ALT_PRESSED.store(false, Ordering::SeqCst);
+    SHIFT_PRESSED.store(false, Ordering::SeqCst);
+    log_write("INFO", "KVM Host: All modifier keys released.");
+}
+
+#[cfg(not(target_os = "windows"))]
+fn release_stuck_modifiers() {
+    // On macOS, simulate key releases via rdev
+    let _ = simulate(&EventType::KeyRelease(Key::ControlLeft));
+    let _ = simulate(&EventType::KeyRelease(Key::Alt));
+    let _ = simulate(&EventType::KeyRelease(Key::ShiftLeft));
+    CTRL_PRESSED.store(false, Ordering::SeqCst);
+    ALT_PRESSED.store(false, Ordering::SeqCst);
+    SHIFT_PRESSED.store(false, Ordering::SeqCst);
+    log_write("INFO", "KVM Host: All modifier keys released (macOS).");
 }
 
 // ============================================================================
@@ -363,7 +402,8 @@ fn grab_callback(event: Event) -> Option<Event> {
     // --- Not active: only do edge detection ---
     if !KVM_ACTIVE.load(Ordering::SeqCst) {
         if let EventType::MouseMove { x, .. } = event.event_type {
-            if !IS_CONNECTING.load(Ordering::SeqCst) {
+            // Don't reconnect during cooldown (prevents auto-reconnect loop)
+            if !IS_CONNECTING.load(Ordering::SeqCst) && !DEACTIVATION_COOLDOWN.load(Ordering::SeqCst) {
                 let (w, _) = get_screen_size();
                 let direction = BORDER_DIRECTION.load(Ordering::SeqCst);
 
@@ -387,14 +427,51 @@ fn grab_callback(event: Event) -> Option<Event> {
     }
 
     // ===================================================================
-    // Active Session: Capture all input
+    // Active Session: Check hotkey FIRST, then capture input
     // ===================================================================
+
+    // Check for deactivation hotkey (e.g. Ctrl+Alt+K)
+    if let EventType::KeyPress(key) = event.event_type {
+        let key_code = key_to_u16(key);
+        let hotkey_key = HOTKEY_KEY.load(Ordering::SeqCst);
+        let need_ctrl = HOTKEY_CTRL.load(Ordering::SeqCst);
+        let need_alt = HOTKEY_ALT.load(Ordering::SeqCst);
+        let need_shift = HOTKEY_SHIFT.load(Ordering::SeqCst);
+
+        let ctrl_ok = !need_ctrl || CTRL_PRESSED.load(Ordering::SeqCst);
+        let alt_ok = !need_alt || ALT_PRESSED.load(Ordering::SeqCst);
+        let shift_ok = !need_shift || SHIFT_PRESSED.load(Ordering::SeqCst);
+
+        if key_code == hotkey_key && ctrl_ok && alt_ok && shift_ok {
+            log_write("INFO", "KVM Host: Hotkey pressed — deactivating KVM.");
+            deactivate_kvm_host();
+            set_active_sender(None);
+            if let Some(app_handle) = APP_HANDLE.get() {
+                let _ = app_handle.emit("kvm-status", KvmStatusUpdate {
+                    active: false, role: "idle".to_string(), target: "".to_string(),
+                });
+            }
+            return Some(event); // Let the key through to Windows
+        }
+
+        // Also check Ctrl+Alt+Escape as emergency release
+        if key == Key::Escape && CTRL_PRESSED.load(Ordering::SeqCst) && ALT_PRESSED.load(Ordering::SeqCst) {
+            log_write("INFO", "KVM Host: Emergency release (Ctrl+Alt+Esc).");
+            deactivate_kvm_host();
+            set_active_sender(None);
+            if let Some(app_handle) = APP_HANDLE.get() {
+                let _ = app_handle.emit("kvm-status", KvmStatusUpdate {
+                    active: false, role: "idle".to_string(), target: "".to_string(),
+                });
+            }
+            return Some(event);
+        }
+    }
 
     #[allow(unreachable_patterns)]
     match event.event_type {
         EventType::MouseMove { x, y } => {
             // *** CRITICAL: Only atomic operations here! ***
-            // At 8KHz this runs 8000x/sec. Any blocking = Windows kills the hook.
             let last_x = LAST_X.load(Ordering::SeqCst);
             let last_y = LAST_Y.load(Ordering::SeqCst);
 
@@ -404,13 +481,12 @@ fn grab_callback(event: Event) -> Option<Event> {
             LAST_X.store(x as i32, Ordering::SeqCst);
             LAST_Y.store(y as i32, Ordering::SeqCst);
 
-            // Accumulate delta — the sender thread will drain at 120Hz
             if dx != 0 || dy != 0 {
                 ACCUM_DX.fetch_add(dx, Ordering::Relaxed);
                 ACCUM_DY.fetch_add(dy, Ordering::Relaxed);
             }
 
-            return None; // Swallow — cursor is clipped by ClipCursor/CGAssociate
+            return None;
         }
 
         EventType::KeyPress(key) => {

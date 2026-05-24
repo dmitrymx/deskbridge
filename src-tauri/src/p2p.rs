@@ -209,9 +209,13 @@ async fn handle_incoming_file_transfer(app_handle: AppHandle, socket: &mut TcpSt
 /// Send a local file to a remote node
 #[tauri::command]
 pub async fn send_file(app_handle: AppHandle, target_ip: String, file_path: String) -> Result<String, String> {
+    crate::kvm::log_write("INFO", &format!("send_file CALLED: target_ip={}, file_path={}", target_ip, file_path));
+    
     let path = Path::new(&file_path);
     if !path.exists() {
-        return Err("File does not exist".to_string());
+        let msg = format!("File does not exist: {}", file_path);
+        crate::kvm::log_write("ERROR", &msg);
+        return Err(msg);
     }
 
     let file_name = path.file_name()
@@ -1070,11 +1074,16 @@ fn get_portal_html() -> &'static str {
 
 #[tauri::command]
 pub async fn pick_file_dialog() -> Result<Option<String>, String> {
-    crate::kvm::log_write("INFO", "pick_file_dialog: Opening file dialog...");
+    crate::kvm::log_write("INFO", "pick_file_dialog: Pausing grab hook for dialog...");
+    
+    // CRITICAL: Pause the grab hook while the file dialog is open.
+    // Windows modal dialogs conflict with WH_MOUSE_LL hooks, especially
+    // at high polling rates. Temporarily disable KVM to let events flow normally.
+    let was_enabled = crate::kvm::KVM_ENABLED.load(std::sync::atomic::Ordering::SeqCst);
+    crate::kvm::KVM_ENABLED.store(false, std::sync::atomic::Ordering::SeqCst);
     
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        // Catch any panic in the dialog thread
         let result = std::panic::catch_unwind(|| {
             rfd::FileDialog::new()
                 .set_title("Выберите файл для отправки")
@@ -1098,6 +1107,10 @@ pub async fn pick_file_dialog() -> Result<Option<String>, String> {
         crate::kvm::log_write("ERROR", &msg);
         msg
     })?;
+    
+    // Restore KVM_ENABLED after dialog closes
+    crate::kvm::KVM_ENABLED.store(was_enabled, std::sync::atomic::Ordering::SeqCst);
+    crate::kvm::log_write("INFO", "pick_file_dialog: Grab hook resumed.");
     
     Ok(result.map(|p| p.to_string_lossy().to_string()))
 }
