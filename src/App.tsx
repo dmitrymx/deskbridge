@@ -419,7 +419,7 @@ function App() {
             <h1 className="font-extrabold text-lg tracking-tight bg-gradient-to-r from-white via-neutral-100 to-neutral-400 bg-clip-text text-transparent">
               DeskBridge
             </h1>
-            <p className="text-[10px] text-neutral-500 font-mono tracking-wider">LOCAL MESH NETWORK • v2.1.0</p>
+            <p className="text-[10px] text-neutral-500 font-mono tracking-wider">LOCAL MESH NETWORK • v2.2.0</p>
           </div>
         </div>
 

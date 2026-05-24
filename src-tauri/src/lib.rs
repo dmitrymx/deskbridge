@@ -73,15 +73,9 @@ fn get_discovered_nodes(app_handle: tauri::AppHandle) -> Result<Vec<mdns::Discov
 }
 
 #[tauri::command]
-fn select_file(app_handle: tauri::AppHandle) -> Result<Option<String>, String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    app_handle.run_on_main_thread(move || {
-        let file = rfd::FileDialog::new().pick_file();
-        let path_str = file.map(|f| f.to_string_lossy().to_string());
-        let _ = tx.send(path_str);
-    }).map_err(|e| e.to_string())?;
-
-    rx.recv().map_err(|e| e.to_string())
+async fn select_file() -> Result<Option<String>, String> {
+    let file = rfd::AsyncFileDialog::new().pick_file().await;
+    Ok(file.map(|f| f.path().to_string_lossy().to_string()))
 }
 
 #[tauri::command]
@@ -104,26 +98,20 @@ fn clear_logs() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn save_log_file(app_handle: tauri::AppHandle) -> Result<bool, String> {
+async fn save_log_file() -> Result<bool, String> {
     let log_path = kvm::LOG_FILE_PATH.get().ok_or("Logger not initialized")?.clone();
     if !log_path.exists() {
         return Err("Log file does not exist yet".to_string());
     }
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    app_handle.run_on_main_thread(move || {
-        let file = rfd::FileDialog::new()
-            .set_file_name("deskbridge.log")
-            .add_filter("Log Files", &["log", "txt"])
-            .save_file();
-        let path_str = file.map(|f| f.to_string_lossy().to_string());
-        let _ = tx.send(path_str);
-    }).map_err(|e| e.to_string())?;
+    let file = rfd::AsyncFileDialog::new()
+        .set_file_name("deskbridge.log")
+        .add_filter("Log Files", &["log", "txt"])
+        .save_file()
+        .await;
 
-    let dest_path_str = rx.recv().map_err(|e| e.to_string())?;
-    if let Some(dest_path_str) = dest_path_str {
-        let dest_path = std::path::Path::new(&dest_path_str);
-        std::fs::copy(&log_path, dest_path).map_err(|e| e.to_string())?;
+    if let Some(file) = file {
+        std::fs::copy(&log_path, file.path()).map_err(|e| e.to_string())?;
         Ok(true)
     } else {
         Ok(false)
