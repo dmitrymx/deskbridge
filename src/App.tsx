@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { save } from "@tauri-apps/plugin-dialog";
 import {
   Monitor,
   Wifi,
@@ -359,7 +359,7 @@ function App() {
     }
 
     try {
-      const filePath = await open({ multiple: false, directory: false }) as string | null;
+      const filePath = await invoke<string | null>("pick_file_dialog");
       if (!filePath) return; // user cancelled
 
       setIsSending(true);
@@ -426,7 +426,7 @@ function App() {
             <h1 className="font-extrabold text-lg tracking-tight bg-gradient-to-r from-white via-neutral-100 to-neutral-400 bg-clip-text text-transparent">
               DeskBridge
             </h1>
-            <p className="text-[10px] text-neutral-500 font-mono tracking-wider">LOCAL MESH NETWORK • v2.2.0</p>
+            <p className="text-[10px] text-neutral-500 font-mono tracking-wider">LOCAL MESH NETWORK • v2.4.0</p>
           </div>
         </div>
 
@@ -1076,7 +1076,7 @@ function App() {
 
       {/* Footer */}
       <footer className="py-5 border-t border-neutral-950 bg-neutral-950/40 text-center text-[10px] text-neutral-600 font-mono tracking-wider z-10">
-        DeskBridge v2.2.0 • Прямое P2P и KVM по локальной сети без облачных серверов
+        DeskBridge v2.4.0 • Прямое P2P и KVM по локальной сети без облачных серверов
       </footer>
     </div>
   );

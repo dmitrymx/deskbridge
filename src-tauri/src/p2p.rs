@@ -1057,3 +1057,26 @@ fn get_portal_html() -> &'static str {
 </html>"##
 }
 
+// ============================================================================
+// File Dialog from Rust (bypasses tauri-plugin-dialog crash)
+//
+// Why: tauri-plugin-dialog's open() causes crash on Windows because:
+// 1. Modal file dialog blocks the message loop
+// 2. WH_MOUSE_LL hook (rdev::grab) can't return in time at 8KHz
+// 3. Windows kills the hook → app crashes
+//
+// Fix: Use rfd crate directly in a blocking thread, separate from UI/hook
+// ============================================================================
+
+#[tauri::command]
+pub async fn pick_file_dialog() -> Result<Option<String>, String> {
+    let result = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Выберите файл для отправки")
+            .pick_file()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(result.map(|p| p.to_string_lossy().to_string()))
+}
