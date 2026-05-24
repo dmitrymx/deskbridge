@@ -184,6 +184,11 @@ pub static HOTKEY_ALT: AtomicBool = AtomicBool::new(true);
 pub static HOTKEY_SHIFT: AtomicBool = AtomicBool::new(false);
 pub static HOTKEY_KEY: AtomicU16 = AtomicU16::new(11); // KeyK
 
+// Cursor speed multiplier for KVM client (applied to received deltas)
+// Default 2.0 — compensates for resolution/DPI differences between host and client
+// (Barrier uses CGEventCreateMouseEvent with delta fields; we use a simpler scaling approach)
+pub static CURSOR_SPEED: AtomicU16 = AtomicU16::new(20); // x10, so 20 = 2.0x
+
 // Connection guard
 pub static IS_CONNECTING: AtomicBool = AtomicBool::new(false);
 
@@ -824,11 +829,16 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                                 match buf[0] {
                                     0 => {
                                         // MouseMove delta
-                                        let dx = f32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
-                                        let dy = f32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
+                                        let raw_dx = f32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
+                                        let raw_dy = f32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
 
-                                        current_x += dx as f64;
-                                        current_y += dy as f64;
+                                        // Apply cursor speed multiplier (stored as x10)
+                                        let speed = CURSOR_SPEED.load(Ordering::Relaxed) as f64 / 10.0;
+                                        let dx = raw_dx as f64 * speed;
+                                        let dy = raw_dy as f64 * speed;
+
+                                        current_x += dx;
+                                        current_y += dy;
 
                                         // Check if cursor should return to host
                                         let direction = BORDER_DIRECTION.load(Ordering::SeqCst);
@@ -854,11 +864,17 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                                     }
                                     1 => {
                                         let val = u16::from_le_bytes([buf[1], buf[2]]);
-                                        let _ = simulate(&EventType::KeyPress(u16_to_key(val)));
+                                        let key = u16_to_key(val);
+                                        if let Err(e) = simulate(&EventType::KeyPress(key)) {
+                                            log_write("ERROR", &format!("KVM Client: KeyPress({:?}) failed: {:?}", key, e));
+                                        }
                                     }
                                     2 => {
                                         let val = u16::from_le_bytes([buf[1], buf[2]]);
-                                        let _ = simulate(&EventType::KeyRelease(u16_to_key(val)));
+                                        let key = u16_to_key(val);
+                                        if let Err(e) = simulate(&EventType::KeyRelease(key)) {
+                                            log_write("ERROR", &format!("KVM Client: KeyRelease({:?}) failed: {:?}", key, e));
+                                        }
                                     }
                                     3 => {
                                         let btn = match buf[1] {

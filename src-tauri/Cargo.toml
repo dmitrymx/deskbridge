@@ -1,6 +1,6 @@
 [package]
 name = "deskbridge"
-version = "2.5.1"
+version = "2.5.2"
 description = "DeskBridge cross-platform KVM and P2P file sharing"
 authors = ["Antigravity"]
 edition = "2021"
