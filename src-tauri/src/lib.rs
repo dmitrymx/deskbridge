@@ -147,7 +147,10 @@ pub fn run() {
         ])
         .on_window_event(|_window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
-                kvm::log_write("INFO", "Window close requested. Force exiting process to clean up threads and hooks.");
+                kvm::log_write("INFO", "Window close requested. Releasing KVM and cleaning up...");
+                // Ensure cursor is released before process exit
+                kvm::release_manual_control().ok();
+                kvm::log_write("INFO", "Cleanup complete. Force exiting process.");
                 std::process::exit(0);
             }
         })

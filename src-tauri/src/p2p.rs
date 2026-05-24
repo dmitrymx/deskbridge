@@ -3,7 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, Duration};
+use std::time::{Instant, Duration, SystemTime};
 use tauri::{AppHandle, Emitter};
 use serde::Serialize;
 use sha2::{Sha256, Digest};
@@ -108,7 +108,7 @@ async fn handle_incoming_file_transfer(app_handle: AppHandle, socket: &mut TcpSt
     let mut writer = BufWriter::new(file);
     let mut hasher = Sha256::new();
     
-    let transfer_id = format!("recv_{}", Instant::now().elapsed().as_nanos());
+    let transfer_id = format!("recv_{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
     
     let _ = app_handle.emit("file-progress", FileProgressUpdate {
         transfer_id: transfer_id.clone(),
@@ -225,7 +225,7 @@ pub async fn send_file(app_handle: AppHandle, target_ip: String, file_path: Stri
 
     crate::kvm::log_write("INFO", &format!("P2P Sender: Starting transfer of '{}' ({} bytes) to {}", file_name, file_size, target_ip));
 
-    let transfer_id = format!("send_{}", Instant::now().elapsed().as_nanos());
+    let transfer_id = format!("send_{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
     
     // Connect to remote peer's file receiver port (53202)
     let address = format!("{}:53202", target_ip);
@@ -497,7 +497,7 @@ async fn handle_web_request(app_handle: AppHandle, mut socket: TcpStream) -> Res
         let file = File::create(&target_path).await?;
         let mut writer = BufWriter::new(file);
         
-        let transfer_id = format!("web_recv_{}", Instant::now().elapsed().as_nanos());
+        let transfer_id = format!("web_recv_{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
         
         let _ = app_handle.emit("file-progress", FileProgressUpdate {
             transfer_id: transfer_id.clone(),
