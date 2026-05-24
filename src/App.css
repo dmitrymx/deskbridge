@@ -1,0 +1,145 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Glassmorphism Styles */
+.glass-panel {
+  background: rgba(15, 16, 22, 0.65);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.glass-panel-glow {
+  position: relative;
+}
+
+.glass-panel-glow::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.12), rgba(168, 85, 247, 0.12));
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+/* Native Dialog Backdrop Styling */
+dialog {
+  border: none;
+  background: transparent;
+  outline: none;
+}
+
+dialog::backdrop {
+  background-color: rgba(6, 7, 10, 0.82);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  animation: backdrop-fade-in 0.25s ease-out forwards;
+}
+
+dialog[open] {
+  animation: modal-scale-in 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+
+/* Animations */
+@keyframes backdrop-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes modal-scale-in {
+  from {
+    transform: scale(0.96) translateY(10px);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1) translateY(0);
+    opacity: 1;
+  }
+}
+
+.pulse-glow-indigo {
+  box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.35);
+  animation: pulse-ring-indigo 2s infinite;
+}
+
+@keyframes pulse-ring-indigo {
+  0% {
+    box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.35);
+  }
+  70% {
+    box-shadow: 0 0 0 10px rgba(99, 102, 241, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(99, 102, 241, 0);
+  }
+}
+
+.pulse-glow-purple {
+  box-shadow: 0 0 0 0 rgba(168, 85, 247, 0.35);
+  animation: pulse-ring-purple 2s infinite;
+}
+
+@keyframes pulse-ring-purple {
+  0% {
+    box-shadow: 0 0 0 0 rgba(168, 85, 247, 0.35);
+  }
+  70% {
+    box-shadow: 0 0 0 10px rgba(168, 85, 247, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(168, 85, 247, 0);
+  }
+}
+
+.grid-mesh {
+  background-image: radial-gradient(rgba(255, 255, 255, 0.015) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Card hover scaling and transitions */
+.hover-lift {
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.hover-lift:hover {
+  transform: translateY(-2px);
+  border-color: rgba(99, 102, 241, 0.3);
+  box-shadow: 0 12px 30px -10px rgba(99, 102, 241, 0.15);
+}
+
+.active-depress {
+  transition: transform 0.1s ease;
+}
+.active-depress:active {
+  transform: scale(0.97);
+}

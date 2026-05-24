@@ -1,0 +1,33 @@
+[package]
+name = "deskbridge"
+version = "0.1.0"
+description = "DeskBridge cross-platform KVM and P2P file sharing"
+authors = ["Antigravity"]
+edition = "2021"
+
+[lib]
+name = "deskbridge_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.35", features = ["full"] }
+mdns-sd = "0.19"
+rdev = { version = "0.5.3", features = ["unstable_grab"] }
+local-ip-address = "0.6"
+gethostname = "0.5"
+mouse_position = "0.1"
+sha2 = "0.10"
+rfd = "0.15"
+dirs = "6.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+macos-accessibility-client = "0.0.2"
+
+
