@@ -160,7 +160,7 @@ pub fn run() {
             kvm::set_kvm_hotkey,
             p2p::send_file,
             p2p::cancel_file_transfer,
-            p2p::pick_file_dialog,
+            p2p::pick_and_send_file,
             get_local_info,
             get_discovered_nodes,
             get_network_interfaces,

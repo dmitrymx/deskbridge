@@ -223,7 +223,7 @@ fn deactivate_kvm_host() {
         // Set cooldown to prevent instant re-trigger from edge detection
         DEACTIVATION_COOLDOWN.store(true, Ordering::SeqCst);
         let _ = std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(Duration::from_millis(1500));
             DEACTIVATION_COOLDOWN.store(false, Ordering::SeqCst);
         });
         log_write("INFO", "KVM Host: Deactivated, cursor released, modifiers reset.");
@@ -685,11 +685,9 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                 deactivate_kvm_host();
                 set_active_sender(None);
 
-                // Warp cursor away from edge to prevent instant re-trigger
-                let direction = BORDER_DIRECTION.load(Ordering::SeqCst);
+                // Warp cursor to CENTER of screen to prevent instant re-trigger
                 let (w, h) = get_screen_size();
-                let rx = if direction == 1 { w - 20.0 } else { 20.0 };
-                let _ = simulate(&EventType::MouseMove { x: rx, y: h / 2.0 });
+                let _ = simulate(&EventType::MouseMove { x: w / 2.0, y: h / 2.0 });
 
                 let _ = app_writer.emit("kvm-status", KvmStatusUpdate {
                     active: false, role: "idle".to_string(), target: "".to_string(),
@@ -786,7 +784,7 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                     let mut buf = [0u8; 9];
                     let mut controlled = true;
 
-                    log_write("INFO", "KVM Client: Control session started.");
+                    log_write("INFO", &format!("KVM Client: Control session started. Accessibility: {}", check_accessibility()));
 
                     while controlled {
                         match socket.read_exact(&mut buf) {

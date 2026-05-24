@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+﻿import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -260,10 +260,24 @@ function App() {
       }
     });
 
+    const unlistenFileSend = listen<{ fileName: string }>("file-send-started", (event) => {
+      setIsSending(true);
+      setFileProgress({
+        transferId: "starting",
+        status: "starting",
+        fileName: event.payload.fileName,
+        progress: 0.0,
+        speed: 0.0,
+        error: null,
+        sha256Matches: null,
+      });
+    });
+
     return () => {
       unlistenMdns.then((f) => f());
       unlistenKvm.then((f) => f());
       unlistenFile.then((f) => f());
+      unlistenFileSend.then((f) => f());
     };
   }, []);
 
@@ -359,32 +373,14 @@ function App() {
     }
 
     try {
-      const filePath = await invoke<string | null>("pick_file_dialog");
-      if (!filePath) return; // user cancelled
-
-      setIsSending(true);
-      setFileProgress({
-        transferId: "starting",
-        status: "starting",
-        fileName: filePath.replace(/\\/g, "/").split("/").pop() || "file",
-        progress: 0.0,
-        speed: 0.0,
-        error: null,
-        sha256Matches: null,
-      });
-
-      await invoke("send_file", {
+      // Single command: opens dialog + sends file atomically via tauri-plugin-dialog
+      // The backend emits 'file-send-started' when a file is selected,
+      // and 'file-progress' events during transfer
+      await invoke("pick_and_send_file", {
         targetIp: selectedNode.ip,
-        filePath,
       });
     } catch (err: any) {
-      setIsSending(false);
-      setFileProgress((prev) => prev ? {
-        ...prev,
-        status: "error",
-        error: err.toString(),
-      } : null);
-      alert("Ошибка отправки файла: " + err);
+      alert("Ошибка: " + err);
     }
   };
 
@@ -426,7 +422,7 @@ function App() {
             <h1 className="font-extrabold text-lg tracking-tight bg-gradient-to-r from-white via-neutral-100 to-neutral-400 bg-clip-text text-transparent">
               DeskBridge
             </h1>
-            <p className="text-[10px] text-neutral-500 font-mono tracking-wider">LOCAL MESH NETWORK • v2.4.0</p>
+            <p className="text-[10px] text-neutral-500 font-mono tracking-wider">LOCAL MESH NETWORK • v2.5.0</p>
           </div>
         </div>
 
@@ -1076,7 +1072,7 @@ function App() {
 
       {/* Footer */}
       <footer className="py-5 border-t border-neutral-950 bg-neutral-950/40 text-center text-[10px] text-neutral-600 font-mono tracking-wider z-10">
-        DeskBridge v2.4.0 • Прямое P2P и KVM по локальной сети без облачных серверов
+        DeskBridge v2.5.0 • Прямое P2P и KVM по локальной сети без облачных серверов
       </footer>
     </div>
   );

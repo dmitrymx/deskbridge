@@ -1062,55 +1062,75 @@ fn get_portal_html() -> &'static str {
 }
 
 // ============================================================================
-// File Dialog from Rust (bypasses tauri-plugin-dialog crash)
+// Safe File Dialog + Send (uses tauri-plugin-dialog, NOT rfd)
 //
-// Why: tauri-plugin-dialog's open() causes crash on Windows because:
-// 1. Modal file dialog blocks the message loop
-// 2. WH_MOUSE_LL hook (rdev::grab) can't return in time at 8KHz
-// 3. Windows kills the hook → app crashes
+// Why: rfd opens a COM-based modal dialog in a separate thread, which conflicts
+// with the WH_MOUSE_LL hook (rdev::grab) in the same process. The modal dialog
+// enters its own message loop → hook can't process events → Windows kills hook
+// → process crashes.
 //
-// Fix: Use rfd crate directly in a blocking thread, separate from UI/hook
+// Fix: Use tauri-plugin-dialog's non-blocking pick_file callback API, which is
+// designed to integrate safely with Tauri's event loop. No COM threading issues.
 // ============================================================================
 
 #[tauri::command]
-pub async fn pick_file_dialog() -> Result<Option<String>, String> {
-    crate::kvm::log_write("INFO", "pick_file_dialog: Pausing grab hook for dialog...");
-    
-    // CRITICAL: Pause the grab hook while the file dialog is open.
-    // Windows modal dialogs conflict with WH_MOUSE_LL hooks, especially
-    // at high polling rates. Temporarily disable KVM to let events flow normally.
+pub fn pick_and_send_file(app_handle: AppHandle, target_ip: String) {
+    use tauri_plugin_dialog::DialogExt;
+
+    crate::kvm::log_write("INFO", "pick_and_send_file: Pausing grab hook, opening dialog...");
+
+    // CRITICAL: Pause grab hook while dialog is open
     let was_enabled = crate::kvm::KVM_ENABLED.load(std::sync::atomic::Ordering::SeqCst);
     crate::kvm::KVM_ENABLED.store(false, std::sync::atomic::Ordering::SeqCst);
-    
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(|| {
-            rfd::FileDialog::new()
-                .set_title("Выберите файл для отправки")
-                .pick_file()
+
+    let app_for_restore = app_handle.clone();
+    let app_for_send = app_handle.clone();
+
+    app_handle.dialog().file()
+        .set_title("Выберите файл для отправки")
+        .pick_file(move |file_response| {
+            // Restore grab hook immediately
+            crate::kvm::KVM_ENABLED.store(was_enabled, std::sync::atomic::Ordering::SeqCst);
+            crate::kvm::log_write("INFO", "pick_and_send_file: Dialog closed, grab hook restored.");
+
+            let file_path = match file_response {
+                Some(f) => match f.into_path() {
+                    Ok(p) => p.to_string_lossy().to_string(),
+                    Err(e) => {
+                        crate::kvm::log_write("ERROR", &format!("pick_and_send_file: Path conversion error: {:?}", e));
+                        return;
+                    }
+                },
+                None => {
+                    crate::kvm::log_write("INFO", "pick_and_send_file: User cancelled dialog.");
+                    return;
+                }
+            };
+
+            crate::kvm::log_write("INFO", &format!("pick_and_send_file: Selected: {}", file_path));
+
+            // Emit file-selected event so frontend knows
+            let file_name = std::path::Path::new(&file_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+
+            let _ = app_for_restore.emit("file-send-started", serde_json::json!({
+                "fileName": file_name,
+            }));
+
+            // Spawn send_file in background async task
+            let target = target_ip.clone();
+            let path = file_path.clone();
+            tauri::async_runtime::spawn(async move {
+                match send_file(app_for_send, target, path).await {
+                    Ok(_) => {
+                        crate::kvm::log_write("INFO", "pick_and_send_file: Transfer complete.");
+                    }
+                    Err(e) => {
+                        crate::kvm::log_write("ERROR", &format!("pick_and_send_file: Transfer failed: {}", e));
+                    }
+                }
+            });
         });
-        
-        match result {
-            Ok(file) => {
-                crate::kvm::log_write("INFO", &format!("pick_file_dialog: Result: {:?}", file.as_ref().map(|p| p.to_string_lossy().to_string())));
-                let _ = tx.send(file);
-            }
-            Err(e) => {
-                crate::kvm::log_write("FATAL", &format!("pick_file_dialog: PANIC in dialog thread: {:?}", e));
-                let _ = tx.send(None);
-            }
-        }
-    });
-    
-    let result = rx.await.map_err(|e| {
-        let msg = format!("pick_file_dialog: Channel error: {}", e);
-        crate::kvm::log_write("ERROR", &msg);
-        msg
-    })?;
-    
-    // Restore KVM_ENABLED after dialog closes
-    crate::kvm::KVM_ENABLED.store(was_enabled, std::sync::atomic::Ordering::SeqCst);
-    crate::kvm::log_write("INFO", "pick_file_dialog: Grab hook resumed.");
-    
-    Ok(result.map(|p| p.to_string_lossy().to_string()))
 }
