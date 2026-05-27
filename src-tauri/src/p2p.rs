@@ -1143,3 +1143,281 @@ pub fn pick_and_send_file(app_handle: AppHandle, target_ip: String) {
             });
         });
 }
+
+// ============================================================================
+// P2P Clipboard File/Folder Transfer System (Port 53204)
+// ============================================================================
+
+#[derive(Debug)]
+pub struct TransferItem {
+    pub is_dir: bool,
+    pub relative_path: String,
+    pub absolute_path: PathBuf,
+    pub file_size: u64,
+}
+
+fn collect_transfer_items(paths: &[String]) -> Vec<TransferItem> {
+    let mut items = Vec::new();
+    for path_str in paths {
+        let path = PathBuf::from(path_str);
+        if !path.exists() {
+            crate::kvm::log_write("WARN", &format!("P2P Clipboard Collect: Path does not exist: {:?}", path));
+            continue;
+        }
+        
+        let parent = match path.parent() {
+            Some(p) => p,
+            None => {
+                crate::kvm::log_write("WARN", &format!("P2P Clipboard Collect: No parent for: {:?}", path));
+                continue;
+            }
+        };
+        
+        if path.is_file() {
+            if let Ok(meta) = path.metadata() {
+                let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                items.push(TransferItem {
+                    is_dir: false,
+                    relative_path: file_name,
+                    absolute_path: path.clone(),
+                    file_size: meta.len(),
+                });
+            }
+        } else if path.is_dir() {
+            // Add the directory itself first
+            let dir_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            items.push(TransferItem {
+                is_dir: true,
+                relative_path: dir_name,
+                absolute_path: path.clone(),
+                file_size: 0,
+            });
+            // Recursively collect contents
+            let mut dirs_to_visit = vec![path.clone()];
+            while let Some(current_dir) = dirs_to_visit.pop() {
+                if let Ok(entries) = std::fs::read_dir(&current_dir) {
+                    for entry in entries.flatten() {
+                        let child_path = entry.path();
+                        let rel_path = match child_path.strip_prefix(parent) {
+                            Ok(p) => p.to_string_lossy().replace('\\', "/"),
+                            Err(_) => continue,
+                        };
+                        if child_path.is_file() {
+                            if let Ok(meta) = child_path.metadata() {
+                                items.push(TransferItem {
+                                    is_dir: false,
+                                    relative_path: rel_path,
+                                    absolute_path: child_path,
+                                    file_size: meta.len(),
+                                });
+                            }
+                        } else if child_path.is_dir() {
+                            items.push(TransferItem {
+                                is_dir: true,
+                                relative_path: rel_path,
+                                absolute_path: child_path.clone(),
+                                file_size: 0,
+                            });
+                            dirs_to_visit.push(child_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    items
+}
+
+pub fn send_clipboard_files(target_ip: String, files: Vec<String>) {
+    tauri::async_runtime::spawn(async move {
+        crate::kvm::log_write("INFO", &format!("P2P Clipboard Sender: Connecting to {}:53204...", target_ip));
+        match TcpStream::connect(format!("{}:53204", target_ip)).await {
+            Ok(mut socket) => {
+                crate::kvm::log_write("INFO", "P2P Clipboard Sender: Connected. Collecting files...");
+                let items = collect_transfer_items(&files);
+                crate::kvm::log_write("INFO", &format!("P2P Clipboard Sender: Collected {} items to transfer", items.len()));
+                
+                let mut writer = BufWriter::new(&mut socket);
+                let mut buffer = vec![0u8; 65536];
+                
+                for item in items {
+                    // Send record type: 1 = File, 2 = Directory
+                    let record_type = if item.is_dir { 2u8 } else { 1u8 };
+                    if let Err(e) = writer.write_all(&[record_type]).await {
+                        crate::kvm::log_write("ERROR", &format!("P2P Clipboard Sender: Failed to write record type: {:?}", e));
+                        return;
+                    }
+                    
+                    // Send path length
+                    let path_bytes = item.relative_path.as_bytes();
+                    let path_len = path_bytes.len() as u16;
+                    if let Err(e) = writer.write_all(&path_len.to_le_bytes()).await {
+                        crate::kvm::log_write("ERROR", &format!("P2P Clipboard Sender: Failed to write path len: {:?}", e));
+                        return;
+                    }
+                    
+                    // Send path
+                    if let Err(e) = writer.write_all(path_bytes).await {
+                        crate::kvm::log_write("ERROR", &format!("P2P Clipboard Sender: Failed to write path: {:?}", e));
+                        return;
+                    }
+                    
+                    if !item.is_dir {
+                        // Send file size
+                        if let Err(e) = writer.write_all(&item.file_size.to_le_bytes()).await {
+                            crate::kvm::log_write("ERROR", &format!("P2P Clipboard Sender: Failed to write file size: {:?}", e));
+                            return;
+                        }
+                        
+                        // Send file contents in chunks
+                        match File::open(&item.absolute_path).await {
+                            Ok(mut file) => {
+                                let mut sent = 0;
+                                while sent < item.file_size {
+                                    match file.read(&mut buffer).await {
+                                        Ok(0) => break,
+                                        Ok(n) => {
+                                            if let Err(e) = writer.write_all(&buffer[..n]).await {
+                                                crate::kvm::log_write("ERROR", &format!("P2P Clipboard Sender: Write error: {:?}", e));
+                                                return;
+                                            }
+                                            sent += n as u64;
+                                        }
+                                        Err(e) => {
+                                            crate::kvm::log_write("ERROR", &format!("P2P Clipboard Sender: File read error: {:?}", e));
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                crate::kvm::log_write("ERROR", &format!("P2P Clipboard Sender: Failed to open file {:?}: {:?}", item.absolute_path, e));
+                                return;
+                            }
+                        }
+                    }
+                }
+                
+                // Send finish record (3)
+                let _ = writer.write_all(&[3u8]).await;
+                let _ = writer.flush().await;
+                crate::kvm::log_write("INFO", "P2P Clipboard Sender: Transfer finished successfully.");
+            }
+            Err(e) => {
+                crate::kvm::log_write("ERROR", &format!("P2P Clipboard Sender: Failed to connect to {}:53204: {:?}", target_ip, e));
+            }
+        }
+    });
+}
+
+pub fn start_p2p_clipboard_server(app_handle: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        match TcpListener::bind("0.0.0.0:53204").await {
+            Ok(listener) => {
+                crate::kvm::log_write("INFO", "P2P Clipboard Server: Listening on port 53204...");
+                while let Ok((mut socket, peer_addr)) = listener.accept().await {
+                    let app_clone = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let peer_ip = peer_addr.ip().to_string();
+                        crate::kvm::log_write("INFO", &format!("P2P Clipboard: Incoming connection from {}", peer_ip));
+                        if let Err(e) = handle_incoming_clipboard_transfer(app_clone, &mut socket).await {
+                            crate::kvm::log_write("ERROR", &format!("P2P Clipboard Receiver Error: {:?}", e));
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                crate::kvm::log_write("ERROR", &format!("Failed to bind P2P clipboard server port 53204: {:?}", e));
+            }
+        }
+    });
+}
+
+async fn handle_incoming_clipboard_transfer(app_handle: AppHandle, socket: &mut TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reader = BufReader::new(socket);
+    
+    // Save to Downloads/DeskBridge_Clipboard/clip_<timestamp>/
+    let download_dir = dirs::download_dir().unwrap_or_else(|| {
+        dirs::home_dir().map(|h| h.join("Downloads")).unwrap_or_else(|| PathBuf::from("."))
+    });
+    let timestamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let base_dir = download_dir.join("DeskBridge_Clipboard").join(format!("clip_{}", timestamp));
+    
+    // Create base directory
+    tokio::fs::create_dir_all(&base_dir).await?;
+    
+    let mut top_level_paths = Vec::new();
+    let mut buffer = vec![0u8; 65536];
+    
+    loop {
+        // Read record type (1 byte)
+        let mut rectype_buf = [0u8; 1];
+        if reader.read_exact(&mut rectype_buf).await.is_err() {
+            // Remote closed connection
+            break;
+        }
+        let record_type = rectype_buf[0];
+        if record_type == 3 {
+            // Finish record
+            break;
+        }
+        
+        // Read path length (2 bytes)
+        let mut path_len_buf = [0u8; 2];
+        reader.read_exact(&mut path_len_buf).await?;
+        let path_len = u16::from_le_bytes(path_len_buf) as usize;
+        
+        // Read path
+        let mut path_bytes = vec![0u8; path_len];
+        reader.read_exact(&mut path_bytes).await?;
+        let relative_path = String::from_utf8(path_bytes)?;
+        
+        // Compute full target path
+        let target_path = base_dir.join(&relative_path);
+        
+        // Keep track of top level paths (direct children of base_dir)
+        let top_level_name = relative_path.split('/').next().unwrap_or(&relative_path);
+        let top_level_full_path = base_dir.join(top_level_name).to_string_lossy().to_string();
+        if !top_level_paths.contains(&top_level_full_path) {
+            top_level_paths.push(top_level_full_path);
+        }
+        
+        if record_type == 2 {
+            // Directory
+            tokio::fs::create_dir_all(&target_path).await?;
+            crate::kvm::log_write("INFO", &format!("P2P Clipboard: Created directory {:?}", target_path));
+        } else if record_type == 1 {
+            // File
+            // Read file size (8 bytes)
+            let mut file_size_buf = [0u8; 8];
+            reader.read_exact(&mut file_size_buf).await?;
+            let file_size = u64::from_le_bytes(file_size_buf);
+            
+            // Ensure parent directory exists
+            if let Some(parent) = target_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            
+            let file = File::create(&target_path).await?;
+            let mut writer = BufWriter::new(file);
+            let mut received: u64 = 0;
+            
+            while received < file_size {
+                let to_read = std::cmp::min(buffer.len() as u64, file_size - received) as usize;
+                reader.read_exact(&mut buffer[..to_read]).await?;
+                writer.write_all(&buffer[..to_read]).await?;
+                received += to_read as u64;
+            }
+            writer.flush().await?;
+            crate::kvm::log_write("INFO", &format!("P2P Clipboard: Received file {:?} ({} bytes)", target_path, file_size));
+        }
+    }
+    
+    // Set local clipboard to the received top-level paths!
+    if !top_level_paths.is_empty() {
+        crate::kvm::set_clipboard_files(app_handle, top_level_paths);
+    }
+    
+    Ok(())
+}
+

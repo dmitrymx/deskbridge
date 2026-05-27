@@ -882,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "deskbridge"
-version = "2.6.1"
+version = "2.7.0"
 dependencies = [
  "clipboard-rs",
  "core-graphics 0.24.0",

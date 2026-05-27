@@ -151,6 +151,9 @@ pub fn run() {
             // Start the Web Portal server for iOS transfers on port 53203
             p2p::start_web_portal(handle.clone());
             
+            // Start the P2P clipboard file transfer receiver server on port 53204
+            p2p::start_p2p_clipboard_server(handle.clone());
+            
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

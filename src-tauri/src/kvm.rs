@@ -162,11 +162,78 @@ fn simple_hash(data: &[u8]) -> u64 {
 }
 
 // ============================================================================
+// Thread-Safe Clipboard Access Helpers (Redirected to Tauri Main UI Thread)
+// ============================================================================
+
+pub fn get_clipboard_files_on_main(app_handle: &AppHandle) -> Option<Vec<String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = app_handle.run_on_main_thread(move || {
+        let res = if let Ok(ctx) = ClipboardContext::new() {
+            if ctx.has(ContentFormat::Files) {
+                ctx.get_files().ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let _ = tx.send(res);
+    });
+    rx.recv().ok().flatten()
+}
+
+pub fn get_clipboard_text_on_main(app_handle: &AppHandle) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = app_handle.run_on_main_thread(move || {
+        let res = if let Ok(ctx) = ClipboardContext::new() {
+            ctx.get_text().ok()
+        } else {
+            None
+        };
+        let _ = tx.send(res);
+    });
+    rx.recv().ok().flatten()
+}
+
+pub fn set_clipboard_text(app_handle: &AppHandle, text: String) {
+    let hash = simple_hash(text.as_bytes());
+    LAST_REMOTE_CLIP_HASH.store(hash, Ordering::SeqCst);
+    
+    let _ = app_handle.run_on_main_thread(move || {
+        if let Ok(ctx) = ClipboardContext::new() {
+            if let Err(e) = ctx.set_text(text) {
+                log_write("ERROR", &format!("Failed to set clipboard text: {:?}", e));
+            } else {
+                log_write("INFO", "Clipboard text successfully set on main thread.");
+            }
+        }
+    });
+}
+
+pub fn set_clipboard_files(app_handle: AppHandle, files: Vec<String>) {
+    let files_str = files.join("\n");
+    let hash = simple_hash(files_str.as_bytes());
+    LAST_REMOTE_CLIP_HASH.store(hash, Ordering::SeqCst);
+    
+    let _ = app_handle.run_on_main_thread(move || {
+        if let Ok(ctx) = ClipboardContext::new() {
+            if let Err(e) = ctx.set_files(files) {
+                log_write("ERROR", &format!("Failed to set clipboard files: {:?}", e));
+            } else {
+                log_write("INFO", "Clipboard files successfully set on main thread.");
+            }
+        }
+    });
+}
+
+
+// ============================================================================
 // Atomic State Variables
 // ============================================================================
 
 pub static KVM_ENABLED: AtomicBool = AtomicBool::new(false);
 pub static KVM_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub static KVM_CLIENT_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static BORDER_X: AtomicU16 = AtomicU16::new(1919);
 pub static BORDER_DIRECTION: AtomicU8 = AtomicU8::new(1); // 1 = Right, 0 = Left
 pub static SCREEN_WIDTH: AtomicU16 = AtomicU16::new(1920);
@@ -376,7 +443,7 @@ fn u16_to_key(val: u16) -> Key {
 // ============================================================================
 
 fn grab_callback(event: Event) -> Option<Event> {
-    if !KVM_ENABLED.load(Ordering::SeqCst) {
+    if !KVM_ENABLED.load(Ordering::SeqCst) || KVM_CLIENT_ACTIVE.load(Ordering::SeqCst) {
         return Some(event);
     }
 
@@ -649,9 +716,18 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
     let address = format!("{}:53201", ip);
     log_write("INFO", &format!("KVM Host: Connecting to Client at {}...", address));
 
-    match TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_secs(3)) {
+    let addr = match address.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            log_write("ERROR", &format!("KVM Host: Invalid target address '{}': {:?}", address, e));
+            IS_CONNECTING.store(false, Ordering::SeqCst);
+            return;
+        }
+    };
+
+    match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
         Ok(stream) => {
-            stream.set_nodelay(true).unwrap();
+            let _ = stream.set_nodelay(true);
 
             // Step 1: Warp mouse to screen center
             let (w, h) = get_screen_size();
@@ -692,7 +768,14 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
             log_write("INFO", "KVM Host: Session active. Delta batching at 120Hz.");
 
             // Step 7: Spawn writer thread (reads from rx, writes to TCP)
-            let mut writer_socket = stream.try_clone().unwrap();
+            let mut writer_socket = match stream.try_clone() {
+                Ok(s) => s,
+                Err(e) => {
+                    log_write("ERROR", &format!("KVM Host: Failed to clone stream: {:?}", e));
+                    deactivate_kvm_host();
+                    return;
+                }
+            };
             let app_writer = app_handle.clone();
             thread::spawn(move || {
                 let mut idle_ticks: u32 = 0;
@@ -771,6 +854,8 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
             // Step 8b: Clipboard sync thread (host → client)
             if CLIPBOARD_SYNC.load(Ordering::SeqCst) {
                 let tx_clip = tx_for_clipboard;
+                let client_ip = ip.clone();
+                let app_handle_clip = app_handle.clone();
                 thread::spawn(move || {
                     log_write("INFO", "KVM Host: Clipboard sync thread started.");
                     let mut last_text_hash: u64 = 0;
@@ -778,59 +863,34 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                         thread::sleep(Duration::from_millis(250));
                         if !CLIPBOARD_SYNC.load(Ordering::SeqCst) { continue; }
 
-                        if let Ok(ctx) = ClipboardContext::new() {
-                            // Priority 1: Check for files in clipboard
-                            if ctx.has(ContentFormat::Files) {
-                                if let Ok(files) = ctx.get_files() {
-                                    if !files.is_empty() {
-                                        let files_str = files.join("\n");
-                                        let hash = simple_hash(files_str.as_bytes());
-                                        if hash != last_text_hash && hash != LAST_REMOTE_CLIP_HASH.load(Ordering::SeqCst) {
-                                            last_text_hash = hash;
-                                            // Send each file
-                                            for file_path in &files {
-                                                let path = std::path::Path::new(file_path);
-                                                if path.exists() && path.is_file() {
-                                                    if let Ok(file_data) = std::fs::read(path) {
-                                                        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                                        let name_bytes = file_name.as_bytes();
-                                                        let name_len = name_bytes.len() as u16;
-                                                        let total_len = (2 + name_bytes.len() + file_data.len()) as u32;
-                                                        if total_len < 100_000_000 { // Max 100MB per file
-                                                            let mut payload = Vec::with_capacity(9 + total_len as usize);
-                                                            payload.push(10); // ClipboardFile
-                                                            payload.extend_from_slice(&total_len.to_le_bytes());
-                                                            payload.extend_from_slice(&[0, 0, 0, 0]);
-                                                            payload.extend_from_slice(&name_len.to_le_bytes());
-                                                            payload.extend_from_slice(name_bytes);
-                                                            payload.extend_from_slice(&file_data);
-                                                            let _ = tx_clip.send(payload);
-                                                            log_write("INFO", &format!("KVM Host: Clipboard file sent: {} ({} bytes)", file_name, file_data.len()));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                        // Priority 1: Check for files in clipboard
+                        if let Some(files) = get_clipboard_files_on_main(&app_handle_clip) {
+                            if !files.is_empty() {
+                                let files_str = files.join("\n");
+                                let hash = simple_hash(files_str.as_bytes());
+                                if hash != last_text_hash && hash != LAST_REMOTE_CLIP_HASH.load(Ordering::SeqCst) {
+                                    last_text_hash = hash;
+                                    log_write("INFO", &format!("KVM Host: Clipboard files detected: {:?}", files));
+                                    crate::p2p::send_clipboard_files(client_ip.clone(), files);
                                 }
                             }
-                            // Priority 2: Check text clipboard (only if no files)
-                            else if let Ok(text) = ctx.get_text() {
-                                if !text.is_empty() {
-                                    let hash = simple_hash(text.as_bytes());
-                                    if hash != last_text_hash && hash != LAST_REMOTE_CLIP_HASH.load(Ordering::SeqCst) {
-                                        last_text_hash = hash;
-                                        let text_bytes = text.as_bytes();
-                                        let len = text_bytes.len() as u32;
-                                        if len < 10_000_000 { // Max 10MB
-                                            let mut payload = Vec::with_capacity(9 + len as usize);
-                                            payload.push(8); // ClipboardText
-                                            payload.extend_from_slice(&len.to_le_bytes());
-                                            payload.extend_from_slice(&[0, 0, 0, 0]); // pad to 9 bytes header
-                                            payload.extend_from_slice(text_bytes);
-                                            let _ = tx_clip.send(payload);
-                                            log_write("INFO", &format!("KVM Host: Clipboard text sent ({} bytes)", len));
-                                        }
+                        }
+                        // Priority 2: Check text clipboard (only if no files)
+                        else if let Some(text) = get_clipboard_text_on_main(&app_handle_clip) {
+                            if !text.is_empty() {
+                                let hash = simple_hash(text.as_bytes());
+                                if hash != last_text_hash && hash != LAST_REMOTE_CLIP_HASH.load(Ordering::SeqCst) {
+                                    last_text_hash = hash;
+                                    let text_bytes = text.as_bytes();
+                                    let len = text_bytes.len() as u32;
+                                    if len < 10_000_000 { // Max 10MB
+                                        let mut payload = Vec::with_capacity(9 + len as usize);
+                                        payload.push(8); // ClipboardText
+                                        payload.extend_from_slice(&len.to_le_bytes());
+                                        payload.extend_from_slice(&[0, 0, 0, 0]); // pad to 9 bytes header
+                                        payload.extend_from_slice(text_bytes);
+                                        let _ = tx_clip.send(payload);
+                                        log_write("INFO", &format!("KVM Host: Clipboard text sent ({} bytes)", len));
                                     }
                                 }
                             }
@@ -842,6 +902,7 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
 
             // Step 9: Spawn reader thread (listens for ReleaseControl from client)
             let mut read_socket = stream;
+            let app_reader = app_handle.clone();
             thread::spawn(move || {
                 let mut buf = [0u8; 9];
                 loop {
@@ -859,11 +920,7 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                                         let mut data = vec![0u8; len];
                                         if read_socket.read_exact(&mut data).is_ok() {
                                             if let Ok(text) = String::from_utf8(data) {
-                                                if let Ok(ctx) = ClipboardContext::new() {
-                                                    let _ = ctx.set_text(text.clone());
-                                                    LAST_REMOTE_CLIP_HASH.store(simple_hash(text.as_bytes()), Ordering::SeqCst);
-                                                    log_write("INFO", &format!("KVM Host: Clipboard text received ({} bytes)", len));
-                                                }
+                                                set_clipboard_text(&app_reader, text);
                                             }
                                         }
                                     }
@@ -874,33 +931,6 @@ fn initiate_kvm_control_session(app_handle: AppHandle, ip: String) {
                                     if len < 10_000_000 {
                                         let mut data = vec![0u8; len];
                                         let _ = read_socket.read_exact(&mut data);
-                                    }
-                                }
-                                10 => {
-                                    let total_len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-                                    if total_len < 100_000_000 {
-                                        let mut data = vec![0u8; total_len];
-                                        if read_socket.read_exact(&mut data).is_ok() {
-                                            if data.len() >= 2 {
-                                                let name_len = u16::from_le_bytes([data[0], data[1]]) as usize;
-                                                if data.len() >= 2 + name_len {
-                                                    let file_name = String::from_utf8_lossy(&data[2..2+name_len]).to_string();
-                                                    let file_data = &data[2+name_len..];
-                                                    // Save to Downloads
-                                                    if let Some(downloads) = dirs::download_dir() {
-                                                        let save_path = downloads.join(&file_name);
-                                                        if std::fs::write(&save_path, file_data).is_ok() {
-                                                            let path_str = save_path.to_string_lossy().to_string();
-                                                            if let Ok(ctx) = ClipboardContext::new() {
-                                                                let _ = ctx.set_files(vec![path_str.clone()]);
-                                                                LAST_REMOTE_CLIP_HASH.store(simple_hash(path_str.as_bytes()), Ordering::SeqCst);
-                                                            }
-                                                            log_write("INFO", &format!("KVM Host: Clipboard file received: {} ({} bytes)", file_name, file_data.len()));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
                                     }
                                 }
                                 _ => {}
@@ -940,8 +970,10 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
         for stream in listener.incoming() {
             match stream {
                 Ok(mut socket) => {
-                    socket.set_nodelay(true).unwrap();
-                    socket.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                    let _ = socket.set_nodelay(true);
+                    let _ = socket.set_read_timeout(Some(Duration::from_secs(30)));
+
+                    KVM_CLIENT_ACTIVE.store(true, Ordering::SeqCst);
 
                     let peer_addr = socket.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
                     log_write("INFO", &format!("KVM Client: Connected by Host at {}", peer_addr));
@@ -957,16 +989,32 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                         log_write("ERROR", &format!("KVM Client: Initial MouseMove failed: {:?}", e));
                     }
 
-                    let mut write_socket = socket.try_clone().unwrap();
+                    let mut write_socket = match socket.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log_write("ERROR", &format!("KVM Client: Failed to clone socket: {:?}", e));
+                            KVM_CLIENT_ACTIVE.store(false, Ordering::SeqCst);
+                            continue;
+                        }
+                    };
                     let mut buf = [0u8; 9];
                     let mut controlled = true;
 
                     log_write("INFO", &format!("KVM Client: Control session started. Accessibility: {}", check_accessibility()));
 
                     // Clipboard sync thread (client → host)
-                    let mut clip_write = write_socket.try_clone().unwrap();
+                    let mut clip_write = match write_socket.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log_write("ERROR", &format!("KVM Client: Failed to clone write_socket: {:?}", e));
+                            KVM_CLIENT_ACTIVE.store(false, Ordering::SeqCst);
+                            continue;
+                        }
+                    };
                     let clip_active = std::sync::Arc::new(AtomicBool::new(true));
                     let clip_active2 = clip_active.clone();
+                    let host_ip = peer_addr.clone();
+                    let app_handle_clip = app_handle.clone();
 
                     thread::spawn(move || {
                         let mut last_text_hash: u64 = 0;
@@ -974,56 +1022,33 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                             thread::sleep(Duration::from_millis(250));
                             if !CLIPBOARD_SYNC.load(Ordering::SeqCst) { continue; }
 
-                            if let Ok(ctx) = ClipboardContext::new() {
-                                // Priority 1: Files
-                                if ctx.has(ContentFormat::Files) {
-                                    if let Ok(files) = ctx.get_files() {
-                                        if !files.is_empty() {
-                                            let files_str = files.join("\n");
-                                            let hash = simple_hash(files_str.as_bytes());
-                                            if hash != last_text_hash && hash != LAST_REMOTE_CLIP_HASH.load(Ordering::SeqCst) {
-                                                last_text_hash = hash;
-                                                for file_path in &files {
-                                                    let path = std::path::Path::new(file_path);
-                                                    if path.exists() && path.is_file() {
-                                                        if let Ok(file_data) = std::fs::read(path) {
-                                                            let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                                            let name_bytes = file_name.as_bytes();
-                                                            let name_len = name_bytes.len() as u16;
-                                                            let total_len = (2 + name_bytes.len() + file_data.len()) as u32;
-                                                            if total_len < 100_000_000 {
-                                                                let mut header = [0u8; 9];
-                                                                header[0] = 10;
-                                                                header[1..5].copy_from_slice(&total_len.to_le_bytes());
-                                                                let _ = clip_write.write_all(&header);
-                                                                let _ = clip_write.write_all(&name_len.to_le_bytes());
-                                                                let _ = clip_write.write_all(name_bytes);
-                                                                let _ = clip_write.write_all(&file_data);
-                                                                let _ = clip_write.flush();
-                                                                log_write("INFO", &format!("KVM Client: Clipboard file sent: {} ({} bytes)", file_name, file_data.len()));
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
+                            // Priority 1: Files
+                            if let Some(files) = get_clipboard_files_on_main(&app_handle_clip) {
+                                if !files.is_empty() {
+                                    let files_str = files.join("\n");
+                                    let hash = simple_hash(files_str.as_bytes());
+                                    if hash != last_text_hash && hash != LAST_REMOTE_CLIP_HASH.load(Ordering::SeqCst) {
+                                        last_text_hash = hash;
+                                        log_write("INFO", &format!("KVM Client: Clipboard files detected: {:?}", files));
+                                        crate::p2p::send_clipboard_files(host_ip.clone(), files);
                                     }
                                 }
-                                // Priority 2: Text
-                                else if let Ok(text) = ctx.get_text() {
-                                    if !text.is_empty() {
-                                        let hash = simple_hash(text.as_bytes());
-                                        if hash != last_text_hash && hash != LAST_REMOTE_CLIP_HASH.load(Ordering::SeqCst) {
-                                            last_text_hash = hash;
-                                            let text_bytes = text.as_bytes();
-                                            let len = text_bytes.len() as u32;
-                                            if len < 10_000_000 {
-                                                let mut header = [0u8; 9];
-                                                header[0] = 8;
-                                                header[1..5].copy_from_slice(&len.to_le_bytes());
-                                                let _ = clip_write.write_all(&header);
-                                                let _ = clip_write.write_all(text_bytes);
+                            }
+                            // Priority 2: Text
+                            else if let Some(text) = get_clipboard_text_on_main(&app_handle_clip) {
+                                if !text.is_empty() {
+                                    let hash = simple_hash(text.as_bytes());
+                                    if hash != last_text_hash && hash != LAST_REMOTE_CLIP_HASH.load(Ordering::SeqCst) {
+                                        last_text_hash = hash;
+                                        let text_bytes = text.as_bytes();
+                                        let len = text_bytes.len() as u32;
+                                        if len < 10_000_000 {
+                                            let mut header = [0u8; 9];
+                                            header[0] = 8;
+                                            header[1..5].copy_from_slice(&len.to_le_bytes());
+                                            if clip_write.write_all(&header).is_ok() && clip_write.write_all(text_bytes).is_ok() {
                                                 let _ = clip_write.flush();
+                                                log_write("INFO", &format!("KVM Client: Clipboard text sent ({} bytes)", len));
                                             }
                                         }
                                     }
@@ -1120,11 +1145,7 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                                             let mut data = vec![0u8; len];
                                             if socket.read_exact(&mut data).is_ok() {
                                                 if let Ok(text) = String::from_utf8(data) {
-                                                    if let Ok(ctx) = ClipboardContext::new() {
-                                                        let _ = ctx.set_text(text.clone());
-                                                        LAST_REMOTE_CLIP_HASH.store(simple_hash(text.as_bytes()), Ordering::SeqCst);
-                                                        log_write("INFO", &format!("KVM Client: Clipboard text received ({} bytes)", len));
-                                                    }
+                                                    set_clipboard_text(&app_handle, text);
                                                 }
                                             }
                                         }
@@ -1135,32 +1156,6 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                                         if len < 10_000_000 {
                                             let mut data = vec![0u8; len];
                                             let _ = socket.read_exact(&mut data);
-                                        }
-                                    }
-                                    10 => {
-                                        let total_len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-                                        if total_len < 100_000_000 {
-                                            let mut data = vec![0u8; total_len];
-                                            if socket.read_exact(&mut data).is_ok() {
-                                                if data.len() >= 2 {
-                                                    let name_len = u16::from_le_bytes([data[0], data[1]]) as usize;
-                                                    if data.len() >= 2 + name_len {
-                                                        let file_name = String::from_utf8_lossy(&data[2..2+name_len]).to_string();
-                                                        let file_data = &data[2+name_len..];
-                                                        if let Some(downloads) = dirs::download_dir() {
-                                                            let save_path = downloads.join(&file_name);
-                                                            if std::fs::write(&save_path, file_data).is_ok() {
-                                                                let path_str = save_path.to_string_lossy().to_string();
-                                                                if let Ok(ctx) = ClipboardContext::new() {
-                                                                    let _ = ctx.set_files(vec![path_str.clone()]);
-                                                                    LAST_REMOTE_CLIP_HASH.store(simple_hash(path_str.as_bytes()), Ordering::SeqCst);
-                                                                }
-                                                                log_write("INFO", &format!("KVM Client: Clipboard file received: {} ({} bytes)", file_name, file_data.len()));
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
                                         }
                                     }
                                     _ => {}
@@ -1174,6 +1169,7 @@ pub fn start_kvm_client_server(app_handle: AppHandle) {
                     }
 
                     clip_active.store(false, Ordering::SeqCst);
+                    KVM_CLIENT_ACTIVE.store(false, Ordering::SeqCst);
                     log_write("INFO", "KVM Client: Control session ended.");
                     let _ = app_handle.emit("kvm-status", KvmStatusUpdate {
                         active: false, role: "idle".to_string(), target: "".to_string(),
